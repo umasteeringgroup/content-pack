@@ -39,25 +39,25 @@
   <AnimationPose ID="BrowIn">
     <frame>250</frame>
   </AnimationPose>
-  <AnimationPose ID="EyesSquint">
+  <AnimationPose ID="EyeSquint">
     <frame>270</frame>
   </AnimationPose>
-  <AnimationPose ID="EyesClose">
+  <AnimationPose ID="EyeClose">
     <frame>290</frame>
   </AnimationPose>
-  <AnimationPose ID="EyesOpen">
+  <AnimationPose ID="EyeOpen">
     <frame>310</frame>
   </AnimationPose>
-  <AnimationPose ID="EyesUp">
+  <AnimationPose ID="EyeUp">
     <frame>330</frame>
   </AnimationPose>
-  <AnimationPose ID="EyesDown">
+  <AnimationPose ID="EyeDown">
     <frame>350</frame>
   </AnimationPose>
-  <AnimationPose ID="EyesIn">
+  <AnimationPose ID="EyeIn">
     <frame>370</frame>
   </AnimationPose>
-  <AnimationPose ID="EyesOut">
+  <AnimationPose ID="EyeOut">
     <frame>390</frame>
   </AnimationPose>
   <AnimationPose ID="JawOpen">
@@ -78,7 +78,7 @@
   <AnimationPose ID="MouthRight">
     <frame>510</frame>
   </AnimationPose>
-  <AnimationPose ID="CheeksPuff">
+  <AnimationPose ID="CheekPuff">
     <frame>530</frame>
   </AnimationPose>
   <AnimationPose ID="TongueOut_Partial">
@@ -152,5 +152,17 @@
   </AnimationPose>
   <AnimationPose ID="TongueNarrow">
     <frame>989</frame>
+  </AnimationPose>
+  <AnimationPose ID="Grasp">
+    <frame>1003</frame>
+  </AnimationPose>
+    <AnimationPose ID="Peace">
+    <frame>1024</frame>
+  </AnimationPose>
+    <AnimationPose ID="Point">
+    <frame>1030</frame>
+  </AnimationPose>
+    <AnimationPose ID="Rude">
+    <frame>1039</frame>
   </AnimationPose>
 </ArrayOfAnimationPose>

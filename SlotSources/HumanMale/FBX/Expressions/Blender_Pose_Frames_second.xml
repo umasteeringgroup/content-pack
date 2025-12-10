@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="us-ascii"?>
+<ArrayOfAnimationPose xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+  <AnimationPose ID="Yawn">
+    <frame>1</frame>
+  </AnimationPose>
+  <AnimationPose ID="Despair">
+    <frame>25</frame>
+  </AnimationPose>
+  <AnimationPose ID="Jovial">
+    <frame>47</frame>
+  </AnimationPose>
+  <AnimationPose ID="Sour">
+    <frame>70</frame>
+  </AnimationPose>
+  <AnimationPose ID="Sad">
+    <frame>90</frame>
+  </AnimationPose>
+  <AnimationPose ID="Happy">
+    <frame>110</frame>
+  </AnimationPose>
+  <AnimationPose ID="Stupid">
+    <frame>130</frame>
+  </AnimationPose>
+</ArrayOfAnimationPose>
