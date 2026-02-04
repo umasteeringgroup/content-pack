@@ -4,7 +4,7 @@
 bl_info = {
     "name": "UMA Tools",
     "author": "UMA Open Source",
-    "version": (1, 0, 10),
+    "version": (1, 0, 11),
     "blender": (4, 5, 0),
     "location": "View3D > Sidebar > UMA Tools",
     "description": "Quick checks and fixes for UMA export readiness.",
@@ -16,7 +16,7 @@ import os
 from mathutils import Matrix
 
 
-ADDON_VERSION_STR = "1.10"
+ADDON_VERSION_STR = "1.11"
 
 
 def _uma_default_export_path(suffix):
@@ -40,6 +40,16 @@ def _iter_target_objects(context, selected_only: bool):
 
     # Only process meshes and armatures (bones) for UMA workflows.
     return [o for o in objs if o is not None and o.type in {'MESH', 'ARMATURE'}]
+
+
+def _deselect_all_objects(context):
+    for obj in context.view_layer.objects:
+        if obj is not None and obj.select_get():
+            obj.select_set(False)
+
+
+def _get_selected_objects(context):
+    return [obj for obj in context.view_layer.objects if obj is not None and obj.select_get()]
 
 
 def _needs_transform_apply(obj: bpy.types.Object) -> bool:
@@ -292,7 +302,7 @@ class UMA_OT_tools_copy_weights_to_selected(bpy.types.Operator):
             return {'CANCELLED'}
 
         prev_active = context.view_layer.objects.active
-        prev_sel = list(context.selected_objects)
+        prev_sel = _get_selected_objects(context)
 
         try:
             for obj in targets:
@@ -312,7 +322,7 @@ class UMA_OT_tools_copy_weights_to_selected(bpy.types.Operator):
                 mod.mix_factor = 1.0
 
                 # Apply modifier (requires object to be active)
-                bpy.ops.object.select_all(action='DESELECT')
+                _deselect_all_objects(context)
                 obj.select_set(True)
                 context.view_layer.objects.active = obj
                 bpy.ops.object.modifier_apply(modifier=mod.name)
@@ -321,7 +331,7 @@ class UMA_OT_tools_copy_weights_to_selected(bpy.types.Operator):
             self.report({'ERROR'}, f"Copy weights failed: {str(e)}")
             return {'CANCELLED'}
         finally:
-            bpy.ops.object.select_all(action='DESELECT')
+            _deselect_all_objects(context)
             for o in prev_sel:
                 if o and o.name in context.scene.objects:
                     o.select_set(True)
@@ -397,6 +407,85 @@ class UMA_OT_tools_remove_empty_vertex_groups(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class UMA_OT_tools_reset_pose_transforms(bpy.types.Operator):
+    bl_idname = "uma_tools.reset_pose_transforms"
+    bl_label = "Reset pose transforms"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        armatures = [o for o in context.scene.objects if o is not None and o.type == 'ARMATURE']
+        if not armatures:
+            self.report({'WARNING'}, "No armatures found in the scene")
+            return {'CANCELLED'}
+
+        prev_active = context.view_layer.objects.active
+        prev_selected = _get_selected_objects(context)
+        prev_mode = prev_active.mode if prev_active else 'OBJECT'
+
+        try:
+            for arm in armatures:
+                _deselect_all_objects(context)
+                arm.select_set(True)
+                context.view_layer.objects.active = arm
+
+                if arm.mode != 'POSE':
+                    bpy.ops.object.mode_set(mode='POSE')
+
+                bpy.ops.pose.select_all(action='SELECT')
+                bpy.ops.pose.transforms_clear()
+
+        except RuntimeError as e:
+            self.report({'ERROR'}, f"Reset pose transforms failed: {str(e)}")
+            return {'CANCELLED'}
+        finally:
+            _deselect_all_objects(context)
+            for o in prev_selected:
+                if o and o.name in context.scene.objects:
+                    o.select_set(True)
+            context.view_layer.objects.active = prev_active
+
+            if prev_active is not None:
+                try:
+                    bpy.ops.object.mode_set(mode=prev_mode)
+                except Exception:
+                    bpy.ops.object.mode_set(mode='OBJECT')
+
+        self.report({'INFO'}, f"Reset pose transforms on {len(armatures)} armature(s)")
+        return {'FINISHED'}
+
+
+class UMA_OT_tools_select_edge_loops(bpy.types.Operator):
+    bl_idname = "uma_tools.select_edge_loops"
+    bl_label = "Select edge loops"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        obj = context.view_layer.objects.active
+        if obj is None or obj.type != 'MESH':
+            self.report({'WARNING'}, "Select a mesh object to use edge loop selection")
+            return {'CANCELLED'}
+
+        prev_mode = obj.mode
+        try:
+            if prev_mode != 'EDIT':
+                bpy.ops.object.mode_set(mode='EDIT')
+
+            bpy.ops.mesh.select_mode(type='EDGE')
+            bpy.ops.mesh.loop_select()
+
+        except RuntimeError as e:
+            self.report({'ERROR'}, f"Select edge loops failed: {str(e)}")
+            return {'CANCELLED'}
+        finally:
+            if obj.mode != prev_mode:
+                try:
+                    bpy.ops.object.mode_set(mode=prev_mode)
+                except Exception:
+                    pass
+
+        return {'FINISHED'}
+
+
 class UMA_OT_tools_fix_transforms(bpy.types.Operator):
     bl_idname = "uma_tools.fix_transforms"
     bl_label = "Fix"
@@ -410,7 +499,7 @@ class UMA_OT_tools_fix_transforms(bpy.types.Operator):
         # Apply transforms to objects that need it.
         # Do not apply armature pose to rest pose (explicitly required).
         prev_active = context.view_layer.objects.active
-        prev_sel = list(context.selected_objects)
+        prev_sel = _get_selected_objects(context)
 
         try:
             for obj in targets:
@@ -421,7 +510,7 @@ class UMA_OT_tools_fix_transforms(bpy.types.Operator):
                     continue
 
                 # Blender ops require active + selected.
-                bpy.ops.object.select_all(action='DESELECT')
+                _deselect_all_objects(context)
                 obj.select_set(True)
                 context.view_layer.objects.active = obj
 
@@ -432,7 +521,7 @@ class UMA_OT_tools_fix_transforms(bpy.types.Operator):
                     pass
         finally:
             # Restore selection
-            bpy.ops.object.select_all(action='DESELECT')
+            _deselect_all_objects(context)
             for o in prev_sel:
                 if o and o.name in context.scene.objects:
                     o.select_set(True)
@@ -449,7 +538,7 @@ class UMA_OT_tools_select_all(bpy.types.Operator):
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
-        bpy.ops.object.select_all(action='DESELECT')
+        _deselect_all_objects(context)
         first_armature = None
         for obj in context.scene.objects:
             if obj is None:
@@ -676,6 +765,14 @@ class UMA_PT_tools_panel(bpy.types.Panel):
             util.separator()
             util.operator(UMA_OT_tools_remove_empty_vertex_groups.bl_idname, text="Remove empty vertex groups")
 
+        # Editing Tools
+        box = layout.box()
+        _draw_fold_header(box, "uma_tools_section_editing_tools", "Editing Tools")
+        if wm.uma_tools_section_editing_tools:
+            edit = box.column(align=True)
+            edit.operator(UMA_OT_tools_reset_pose_transforms.bl_idname, text="Reset pose transforms")
+            edit.operator(UMA_OT_tools_select_edge_loops.bl_idname, text="Select edge loops")
+
         # UMA Export
         box = layout.box()
         _draw_fold_header(box, "uma_tools_section_export", "UMA Export")
@@ -707,6 +804,8 @@ classes = (
     UMA_OT_tools_copy_weights_to_selected,
     UMA_OT_tools_process_rename_selected,
     UMA_OT_tools_remove_empty_vertex_groups,
+    UMA_OT_tools_reset_pose_transforms,
+    UMA_OT_tools_select_edge_loops,
     UMA_OT_tools_fbx_export_all,
     UMA_OT_tools_fbx_export_selected,
     UMA_PT_tools_panel,
@@ -775,6 +874,7 @@ def register():
         ("uma_tools_section_error_checking", True),
         ("uma_tools_section_copy_weights", False),
         ("uma_tools_section_utilities", False),
+        ("uma_tools_section_editing_tools", False),
         ("uma_tools_section_export", True),
     ):
         if hasattr(bpy.types.WindowManager, prop_name):
@@ -822,6 +922,7 @@ def unregister():
         "uma_tools_section_error_checking",
         "uma_tools_section_copy_weights",
         "uma_tools_section_utilities",
+        "uma_tools_section_editing_tools",
         "uma_tools_section_export",
     ):
         if hasattr(bpy.types.WindowManager, prop_name):
