@@ -4,7 +4,7 @@
 bl_info = {
     "name": "UMA Tools",
     "author": "UMA Open Source",
-    "version": (1, 0, 11),
+    "version": (1, 0, 13),
     "blender": (4, 5, 0),
     "location": "View3D > Sidebar > UMA Tools",
     "description": "Quick checks and fixes for UMA export readiness.",
@@ -13,10 +13,11 @@ bl_info = {
 
 import bpy
 import os
-from mathutils import Matrix
+import bmesh
+from mathutils import Matrix, kdtree
 
 
-ADDON_VERSION_STR = "1.11"
+ADDON_VERSION_STR = "1.13"
 
 
 def _uma_default_export_path(suffix):
@@ -486,6 +487,91 @@ class UMA_OT_tools_select_edge_loops(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class UMA_OT_tools_copy_weights_mirrored(bpy.types.Operator):
+    bl_idname = "uma_tools.copy_weights_mirrored"
+    bl_label = "Copy Weights Mirrored"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        obj = context.view_layer.objects.active
+        if obj is None or obj.type != 'MESH':
+            self.report({'WARNING'}, "Select a mesh object to copy mirrored weights")
+            return {'CANCELLED'}
+
+        prev_mode = obj.mode
+        try:
+            if prev_mode != 'EDIT':
+                bpy.ops.object.mode_set(mode='EDIT')
+
+            bm = bmesh.from_edit_mesh(obj.data)
+            selected_verts = [v for v in bm.verts if v.select]
+            if not selected_verts:
+                self.report({'WARNING'}, "No selected vertices found")
+                return {'CANCELLED'}
+
+            kd = kdtree.KDTree(len(bm.verts))
+            for v in bm.verts:
+                kd.insert(v.co, v.index)
+            kd.balance()
+
+            mirror_map = []
+            for v in selected_verts:
+                mirror_pos = v.co.copy()
+                mirror_pos.x *= -1.0
+
+                _co, mirror_index, dist = kd.find(mirror_pos)
+                if dist > 1e-6:
+                    mirror_map.append((v.index, None))
+                else:
+                    mirror_map.append((v.index, mirror_index))
+
+            bpy.ops.object.mode_set(mode='OBJECT')
+
+            mesh = obj.data
+            copied = 0
+            skipped = 0
+
+            for src_index, mirror_index in mirror_map:
+                if mirror_index is None:
+                    skipped += 1
+                    continue
+
+                src_vert = mesh.vertices[src_index]
+                for g in src_vert.groups:
+                    src_group = obj.vertex_groups[g.group]
+                    src_name = src_group.name
+                    if src_name.startswith("Left"):
+                        tgt_name = "Right" + src_name[4:]
+                    elif src_name.startswith("Right"):
+                        tgt_name = "Left" + src_name[5:]
+                    else:
+                        tgt_name = src_name
+
+                    tgt_group = obj.vertex_groups.get(tgt_name)
+                    if tgt_group is None:
+                        tgt_group = obj.vertex_groups.new(name=tgt_name)
+
+                    tgt_group.add([mirror_index], g.weight, 'REPLACE')
+
+                copied += 1
+
+        except RuntimeError as e:
+            self.report({'ERROR'}, f"Copy mirrored weights failed: {str(e)}")
+            return {'CANCELLED'}
+        finally:
+            if obj.mode != prev_mode:
+                try:
+                    bpy.ops.object.mode_set(mode=prev_mode)
+                except Exception:
+                    pass
+
+        if skipped > 0:
+            self.report({'INFO'}, f"Copied weights for {copied} vertex(es); skipped {skipped} without a mirror")
+        else:
+            self.report({'INFO'}, f"Copied weights for {copied} vertex(es)")
+        return {'FINISHED'}
+
+
 class UMA_OT_tools_fix_transforms(bpy.types.Operator):
     bl_idname = "uma_tools.fix_transforms"
     bl_label = "Fix"
@@ -772,6 +858,7 @@ class UMA_PT_tools_panel(bpy.types.Panel):
             edit = box.column(align=True)
             edit.operator(UMA_OT_tools_reset_pose_transforms.bl_idname, text="Reset pose transforms")
             edit.operator(UMA_OT_tools_select_edge_loops.bl_idname, text="Select edge loops")
+            edit.operator(UMA_OT_tools_copy_weights_mirrored.bl_idname, text="Copy Weights Mirrored")
 
         # UMA Export
         box = layout.box()
@@ -806,6 +893,7 @@ classes = (
     UMA_OT_tools_remove_empty_vertex_groups,
     UMA_OT_tools_reset_pose_transforms,
     UMA_OT_tools_select_edge_loops,
+    UMA_OT_tools_copy_weights_mirrored,
     UMA_OT_tools_fbx_export_all,
     UMA_OT_tools_fbx_export_selected,
     UMA_PT_tools_panel,
