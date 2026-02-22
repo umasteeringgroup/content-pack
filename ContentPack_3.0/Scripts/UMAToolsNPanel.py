@@ -4,7 +4,7 @@
 bl_info = {
     "name": "UMA Tools",
     "author": "UMA Open Source",
-    "version": (1, 0, 13),
+    "version": (1, 0, 22),
     "blender": (4, 5, 0),
     "location": "View3D > Sidebar > UMA Tools",
     "description": "Quick checks and fixes for UMA export readiness.",
@@ -17,7 +17,7 @@ import bmesh
 from mathutils import Matrix, kdtree
 
 
-ADDON_VERSION_STR = "1.13"
+ADDON_VERSION_STR = "1.22"
 
 
 def _uma_default_export_path(suffix):
@@ -51,6 +51,31 @@ def _deselect_all_objects(context):
 
 def _get_selected_objects(context):
     return [obj for obj in context.view_layer.objects if obj is not None and obj.select_get()]
+
+
+def _swap_left_right_name(name: str) -> str:
+    if name.startswith("Left"):
+        return "Right" + name[4:]
+    if name.startswith("Right"):
+        return "Left" + name[5:]
+    return name
+
+
+def _on_quick_select_index_update(self, context):
+    obj = context.view_layer.objects.active
+    if obj is None or obj.type != 'MESH':
+        return
+
+    idx = self.uma_tools_group_quick_select_index
+    if idx < 0 or idx >= len(self.uma_tools_group_quick_select):
+        return
+
+    name = self.uma_tools_group_quick_select[idx].name
+    vg = obj.vertex_groups.get(name)
+    if vg is None:
+        return
+
+    obj.vertex_groups.active_index = vg.index
 
 
 def _needs_transform_apply(obj: bpy.types.Object) -> bool:
@@ -292,6 +317,7 @@ class UMA_OT_tools_copy_weights_to_selected(bpy.types.Operator):
 
     def execute(self, context):
         wm = context.window_manager
+        scene = context.scene
         source = getattr(wm, "uma_tools_weights_source", None)
         if source is None or source.type != 'MESH':
             self.report({'WARNING'}, "Pick a mesh source object for weights")
@@ -316,7 +342,7 @@ class UMA_OT_tools_copy_weights_to_selected(bpy.types.Operator):
                 mod.data_types_verts = {'VGROUP_WEIGHTS'}
 
                 # Mapping as requested
-                mod.vert_mapping = 'NEAREST_POLY'
+                mod.vert_mapping = 'POLY_NEAREST'
 
                 # Mix settings
                 mod.mix_mode = 'REPLACE'
@@ -572,6 +598,179 @@ class UMA_OT_tools_copy_weights_mirrored(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class UMA_OT_tools_add_current_vertex_group(bpy.types.Operator):
+    bl_idname = "uma_tools.add_current_vertex_group"
+    bl_label = "Add current vertex group"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        obj = context.view_layer.objects.active
+        if obj is None or obj.type != 'MESH':
+            self.report({'WARNING'}, "Select a mesh object with an active vertex group")
+            return {'CANCELLED'}
+
+        vg = obj.vertex_groups.active
+        if vg is None:
+            self.report({'WARNING'}, "No active vertex group to add")
+            return {'CANCELLED'}
+
+        scene = context.scene
+        for item in scene.uma_tools_group_quick_select:
+            if item.name == vg.name:
+                self.report({'INFO'}, f"'{vg.name}' already added")
+                return {'CANCELLED'}
+
+        new_item = scene.uma_tools_group_quick_select.add()
+        new_item.name = vg.name
+        scene.uma_tools_group_quick_select_index = len(scene.uma_tools_group_quick_select) - 1
+        return {'FINISHED'}
+
+
+class UMA_OT_tools_select_vertex_group(bpy.types.Operator):
+    bl_idname = "uma_tools.select_vertex_group"
+    bl_label = "Select"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    group_name: bpy.props.StringProperty(default="")
+
+    def execute(self, context):
+        obj = context.view_layer.objects.active
+        if obj is None or obj.type != 'MESH':
+            self.report({'WARNING'}, "Select a mesh object")
+            return {'CANCELLED'}
+
+        vg = obj.vertex_groups.get(self.group_name)
+        if vg is None:
+            self.report({'WARNING'}, f"Vertex group '{self.group_name}' not found")
+            return {'CANCELLED'}
+
+        obj.vertex_groups.active_index = vg.index
+
+        try:
+            bpy.ops.object.vertex_group_select()
+        except RuntimeError:
+            prev_mode = obj.mode
+            try:
+                bpy.ops.object.mode_set(mode='EDIT')
+                bpy.ops.object.vertex_group_select()
+            except RuntimeError:
+                pass
+            finally:
+                if obj.mode != prev_mode:
+                    try:
+                        bpy.ops.object.mode_set(mode=prev_mode)
+                    except Exception:
+                        pass
+
+        return {'FINISHED'}
+
+
+class UMA_OT_tools_select_vertex_group_opposite(bpy.types.Operator):
+    bl_idname = "uma_tools.select_vertex_group_opposite"
+    bl_label = "Opposite"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    group_name: bpy.props.StringProperty(default="")
+
+    def execute(self, context):
+        obj = context.view_layer.objects.active
+        if obj is None or obj.type != 'MESH':
+            self.report({'WARNING'}, "Select a mesh object")
+            return {'CANCELLED'}
+
+        opposite_name = _swap_left_right_name(self.group_name)
+        if opposite_name == self.group_name:
+            self.report({'WARNING'}, "No Left/Right prefix to swap")
+            return {'CANCELLED'}
+
+        vg = obj.vertex_groups.get(opposite_name)
+        if vg is None:
+            self.report({'WARNING'}, f"Vertex group '{opposite_name}' not found")
+            return {'CANCELLED'}
+
+        obj.vertex_groups.active_index = vg.index
+
+        return {'FINISHED'}
+
+
+class UMA_OT_tools_select_all_vertices(bpy.types.Operator):
+    bl_idname = "uma_tools.select_all_vertices"
+    bl_label = "Select all vertexes"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        obj = context.view_layer.objects.active
+        if obj is None or obj.type != 'MESH':
+            self.report({'WARNING'}, "Select a mesh object")
+            return {'CANCELLED'}
+
+        prev_mode = obj.mode
+        try:
+            if prev_mode != 'EDIT':
+                bpy.ops.object.mode_set(mode='EDIT')
+            bpy.ops.mesh.select_all(action='SELECT')
+        except RuntimeError as e:
+            self.report({'ERROR'}, f"Select all vertices failed: {str(e)}")
+            return {'CANCELLED'}
+        finally:
+            if obj.mode != prev_mode:
+                try:
+                    bpy.ops.object.mode_set(mode=prev_mode)
+                except Exception:
+                    pass
+
+        return {'FINISHED'}
+
+
+class UMA_OT_tools_unselect_all_vertices(bpy.types.Operator):
+    bl_idname = "uma_tools.unselect_all_vertices"
+    bl_label = "Unselect all vertexes"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        obj = context.view_layer.objects.active
+        if obj is None or obj.type != 'MESH':
+            self.report({'WARNING'}, "Select a mesh object")
+            return {'CANCELLED'}
+
+        prev_mode = obj.mode
+        try:
+            if prev_mode != 'EDIT':
+                bpy.ops.object.mode_set(mode='EDIT')
+            bpy.ops.mesh.select_all(action='DESELECT')
+        except RuntimeError as e:
+            self.report({'ERROR'}, f"Unselect all vertices failed: {str(e)}")
+            return {'CANCELLED'}
+        finally:
+            if obj.mode != prev_mode:
+                try:
+                    bpy.ops.object.mode_set(mode=prev_mode)
+                except Exception:
+                    pass
+
+        return {'FINISHED'}
+
+
+class UMA_OT_tools_remove_vertex_group_quick_select(bpy.types.Operator):
+    bl_idname = "uma_tools.remove_vertex_group_quick_select"
+    bl_label = "Remove"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    index: bpy.props.IntProperty(default=-1)
+
+    def execute(self, context):
+        scene = context.scene
+        if self.index < 0 or self.index >= len(scene.uma_tools_group_quick_select):
+            return {'CANCELLED'}
+
+        scene.uma_tools_group_quick_select.remove(self.index)
+        scene.uma_tools_group_quick_select_index = min(
+            scene.uma_tools_group_quick_select_index,
+            max(0, len(scene.uma_tools_group_quick_select) - 1),
+        )
+        return {'FINISHED'}
+
+
 class UMA_OT_tools_fix_transforms(bpy.types.Operator):
     bl_idname = "uma_tools.fix_transforms"
     bl_label = "Fix"
@@ -782,6 +981,7 @@ class UMA_PT_tools_panel(bpy.types.Panel):
     def draw(self, context):
         layout = self.layout
         wm = context.window_manager
+        scene = context.scene
 
         row = layout.row()
         row.label(text=f"Version: {ADDON_VERSION_STR}")
@@ -832,11 +1032,14 @@ class UMA_PT_tools_panel(bpy.types.Panel):
                 col.label(text="Selected:")
                 col.label(text=getattr(sel, "text", ""))
 
-        # Copy Weights
+        # Rigging and Weights
         box = layout.box()
-        _draw_fold_header(box, "uma_tools_section_copy_weights", "Copy Weights")
+        _draw_fold_header(box, "uma_tools_section_copy_weights", "Rigging and Weights")
         if wm.uma_tools_section_copy_weights:
             col = box.column(align=True)
+            col.operator(UMA_OT_tools_reset_pose_transforms.bl_idname, text="Reset pose transforms")
+            col.operator(UMA_OT_tools_copy_weights_mirrored.bl_idname, text="Copy Weights Mirrored")
+            col.separator()
             col.prop(wm, "uma_tools_weights_source", text="Source")
             col.operator(UMA_OT_tools_copy_weights_to_selected.bl_idname, text="Copy weights to all selected")
 
@@ -856,9 +1059,26 @@ class UMA_PT_tools_panel(bpy.types.Panel):
         _draw_fold_header(box, "uma_tools_section_editing_tools", "Editing Tools")
         if wm.uma_tools_section_editing_tools:
             edit = box.column(align=True)
-            edit.operator(UMA_OT_tools_reset_pose_transforms.bl_idname, text="Reset pose transforms")
             edit.operator(UMA_OT_tools_select_edge_loops.bl_idname, text="Select edge loops")
-            edit.operator(UMA_OT_tools_copy_weights_mirrored.bl_idname, text="Copy Weights Mirrored")
+
+        # Vertex Group Quick Select
+        box = layout.box()
+        _draw_fold_header(box, "uma_tools_section_vertex_group_quick_select", "Vertex Group Quick Select")
+        if wm.uma_tools_section_vertex_group_quick_select:
+            vg = box.column(align=True)
+            row = vg.row(align=True)
+            row.operator(UMA_OT_tools_select_all_vertices.bl_idname, text="Select all vertexes")
+            row.operator(UMA_OT_tools_unselect_all_vertices.bl_idname, text="Unselect all vertexes")
+            vg.operator(UMA_OT_tools_add_current_vertex_group.bl_idname, text="Add current vertex group")
+            vg.template_list(
+                "UMA_UL_tools_vertex_group_quick_select",
+                "",
+                scene,
+                "uma_tools_group_quick_select",
+                scene,
+                "uma_tools_group_quick_select_index",
+                rows=6,
+            )
 
         # UMA Export
         box = layout.box()
@@ -873,6 +1093,10 @@ class UMA_ToolsReportLine(bpy.types.PropertyGroup):
     text: bpy.props.StringProperty(default="")
 
 
+class UMA_ToolsVertexGroupQuickSelectItem(bpy.types.PropertyGroup):
+    name: bpy.props.StringProperty(default="")
+
+
 class UMA_UL_tools_report(bpy.types.UIList):
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
         if self.layout_type in {'DEFAULT', 'COMPACT'}:
@@ -881,9 +1105,28 @@ class UMA_UL_tools_report(bpy.types.UIList):
             layout.label(text="")
 
 
+class UMA_UL_tools_vertex_group_quick_select(bpy.types.UIList):
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
+        if self.layout_type in {'DEFAULT', 'COMPACT'}:
+            row = layout.row(align=True)
+            row.label(text=getattr(item, "name", ""))
+            button_row = row.row(align=True)
+            button_row.scale_x = 0.7
+            op = button_row.operator(UMA_OT_tools_select_vertex_group.bl_idname, text="Select")
+            op.group_name = getattr(item, "name", "")
+            op = button_row.operator(UMA_OT_tools_select_vertex_group_opposite.bl_idname, text="Opposite")
+            op.group_name = getattr(item, "name", "")
+            op = row.operator(UMA_OT_tools_remove_vertex_group_quick_select.bl_idname, text="", icon='X')
+            op.index = index
+        else:
+            layout.label(text="")
+
+
 classes = (
     UMA_ToolsReportLine,
+    UMA_ToolsVertexGroupQuickSelectItem,
     UMA_UL_tools_report,
+    UMA_UL_tools_vertex_group_quick_select,
     UMA_OT_tools_check_errors,
     UMA_OT_tools_insert_global_position_bones,
     UMA_OT_tools_select_all,
@@ -894,6 +1137,12 @@ classes = (
     UMA_OT_tools_reset_pose_transforms,
     UMA_OT_tools_select_edge_loops,
     UMA_OT_tools_copy_weights_mirrored,
+    UMA_OT_tools_add_current_vertex_group,
+    UMA_OT_tools_select_vertex_group,
+    UMA_OT_tools_select_vertex_group_opposite,
+    UMA_OT_tools_select_all_vertices,
+    UMA_OT_tools_unselect_all_vertices,
+    UMA_OT_tools_remove_vertex_group_quick_select,
     UMA_OT_tools_fbx_export_all,
     UMA_OT_tools_fbx_export_selected,
     UMA_PT_tools_panel,
@@ -923,6 +1172,25 @@ def register():
 
     bpy.types.WindowManager.uma_tools_report_lines = bpy.props.CollectionProperty(type=UMA_ToolsReportLine)
     bpy.types.WindowManager.uma_tools_report_index = bpy.props.IntProperty(default=0)
+
+    if hasattr(bpy.types.Scene, "uma_tools_group_quick_select"):
+        try:
+            del bpy.types.Scene.uma_tools_group_quick_select
+        except Exception:
+            pass
+    if hasattr(bpy.types.Scene, "uma_tools_group_quick_select_index"):
+        try:
+            del bpy.types.Scene.uma_tools_group_quick_select_index
+        except Exception:
+            pass
+
+    bpy.types.Scene.uma_tools_group_quick_select = bpy.props.CollectionProperty(
+        type=UMA_ToolsVertexGroupQuickSelectItem
+    )
+    bpy.types.Scene.uma_tools_group_quick_select_index = bpy.props.IntProperty(
+        default=0,
+        update=_on_quick_select_index_update,
+    )
 
     if hasattr(bpy.types.WindowManager, "uma_tools_weights_source"):
         try:
@@ -963,6 +1231,7 @@ def register():
         ("uma_tools_section_copy_weights", False),
         ("uma_tools_section_utilities", False),
         ("uma_tools_section_editing_tools", False),
+        ("uma_tools_section_vertex_group_quick_select", False),
         ("uma_tools_section_export", True),
     ):
         if hasattr(bpy.types.WindowManager, prop_name):
@@ -989,6 +1258,17 @@ def unregister():
         except Exception:
             pass
 
+    if hasattr(bpy.types.Scene, "uma_tools_group_quick_select"):
+        try:
+            del bpy.types.Scene.uma_tools_group_quick_select
+        except Exception:
+            pass
+    if hasattr(bpy.types.Scene, "uma_tools_group_quick_select_index"):
+        try:
+            del bpy.types.Scene.uma_tools_group_quick_select_index
+        except Exception:
+            pass
+
     if hasattr(bpy.types.WindowManager, "uma_tools_weights_source"):
         try:
             del bpy.types.WindowManager.uma_tools_weights_source
@@ -1011,6 +1291,7 @@ def unregister():
         "uma_tools_section_copy_weights",
         "uma_tools_section_utilities",
         "uma_tools_section_editing_tools",
+        "uma_tools_section_vertex_group_quick_select",
         "uma_tools_section_export",
     ):
         if hasattr(bpy.types.WindowManager, prop_name):
