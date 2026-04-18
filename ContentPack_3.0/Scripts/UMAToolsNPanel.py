@@ -4,7 +4,7 @@
 bl_info = {
     "name": "UMA Tools",
     "author": "UMA Open Source",
-    "version": (1, 0, 22),
+    "version": (1, 0, 29),
     "blender": (4, 5, 0),
     "location": "View3D > Sidebar > UMA Tools",
     "description": "Quick checks and fixes for UMA export readiness.",
@@ -14,10 +14,362 @@ bl_info = {
 import bpy
 import os
 import bmesh
+import math
 from mathutils import Matrix, kdtree
 
 
-ADDON_VERSION_STR = "1.22"
+ADDON_VERSION_STR = "1.29"
+
+
+def _ensure_object_mode(context, obj: bpy.types.Object):
+    if obj is None:
+        return
+    if obj.mode == 'OBJECT':
+        return
+    prev_active = context.view_layer.objects.active
+    try:
+        context.view_layer.objects.active = obj
+        bpy.ops.object.mode_set(mode='OBJECT')
+    except Exception:
+        pass
+    finally:
+        context.view_layer.objects.active = prev_active
+
+
+def _udim_tile_from_uv(uv) -> tuple[int, int]:
+    # UDIM tiles are defined by integer offsets of UV space.
+    # tile (0,0) corresponds to UDIM 1001.
+    return (int(math.floor(uv[0])), int(math.floor(uv[1])))
+
+
+def _udim_number_from_tile(tile_u: int, tile_v: int) -> int:
+    # Standard UDIM numbering: 1001 + U + 10*V
+    return 1001 + int(tile_u) + int(tile_v) * 10
+
+
+def _unique_material_name(base_name: str) -> str:
+    if bpy.data.materials.get(base_name) is None:
+        return base_name
+    i = 1
+    while True:
+        candidate = f"{base_name}.{i:03d}"
+        if bpy.data.materials.get(candidate) is None:
+            return candidate
+        i += 1
+
+
+def _is_udim_image(img: bpy.types.Image | None) -> bool:
+    if img is None:
+        return False
+    try:
+        if getattr(img, "source", None) == 'TILED':
+            return True
+    except Exception:
+        pass
+
+    try:
+        fp = (getattr(img, "filepath", "") or "")
+        if "<UDIM>" in fp:
+            return True
+    except Exception:
+        pass
+
+    return False
+
+
+def _force_image_single_file(img: bpy.types.Image | None, abs_path: str):
+    if img is None:
+        return
+    try:
+        img.source = 'FILE'
+    except Exception:
+        pass
+    for attr_name in ("filepath", "filepath_raw"):
+        try:
+            setattr(img, attr_name, abs_path)
+        except Exception:
+            pass
+    try:
+        # If this image has UDIM tiles, try to clear them.
+        tiles = getattr(img, "tiles", None)
+        if tiles is not None:
+            try:
+                tiles.clear()
+            except Exception:
+                pass
+    except Exception:
+        pass
+    try:
+        img.reload()
+    except Exception:
+        pass
+
+
+def _try_open_image_no_udim(abs_path: str) -> bpy.types.Image | None:
+    # Use operator-based open with UDIM detection disabled (if an IMAGE_EDITOR area exists).
+    # This is best-effort; if it fails, callers should fall back to bpy.data.images.load.
+    screen = getattr(bpy.context, "screen", None)
+    if screen is None:
+        return None
+
+    img_area = None
+    img_region = None
+    swapped_area = None
+    swapped_area_prev_type = None
+    try:
+        for area in screen.areas:
+            if area is None:
+                continue
+            if area.type != 'IMAGE_EDITOR':
+                continue
+            img_area = area
+            for r in area.regions:
+                if r.type == 'WINDOW':
+                    img_region = r
+                    break
+            break
+    except Exception:
+        img_area = None
+        img_region = None
+
+    # If no image editor exists, temporarily switch the first area.
+    if img_area is None or img_region is None:
+        try:
+            swapped_area = next((a for a in screen.areas if a is not None), None)
+            if swapped_area is not None:
+                swapped_area_prev_type = swapped_area.type
+                swapped_area.type = 'IMAGE_EDITOR'
+                img_area = swapped_area
+                img_region = next((r for r in swapped_area.regions if r.type == 'WINDOW'), None)
+        except Exception:
+            img_area = None
+            img_region = None
+
+    if img_area is None or img_region is None:
+        return None
+
+    before = set()
+    try:
+        for im in bpy.data.images:
+            try:
+                before.add(im.as_pointer())
+            except Exception:
+                pass
+    except Exception:
+        before = set()
+
+    try:
+        with bpy.context.temp_override(area=img_area, region=img_region):
+            try:
+                bpy.ops.image.open(
+                    filepath=abs_path,
+                    relative_path=False,
+                    check_existing=False,
+                    use_sequence_detection=False,
+                    use_udim_detecting=False,
+                )
+            except TypeError:
+                # Some builds use a slightly different arg name.
+                bpy.ops.image.open(
+                    filepath=abs_path,
+                    relative_path=False,
+                    check_existing=False,
+                    use_sequence_detection=False,
+                    use_udim_detection=False,
+                )
+    except Exception:
+        return None
+    finally:
+        if swapped_area is not None and swapped_area_prev_type is not None:
+            try:
+                swapped_area.type = swapped_area_prev_type
+            except Exception:
+                pass
+
+    # Pick the newest image that matches the path.
+    candidates = []
+    for im in bpy.data.images:
+        try:
+            if im.as_pointer() in before:
+                continue
+        except Exception:
+            continue
+
+        try:
+            fp = bpy.path.abspath(getattr(im, "filepath", "") or "")
+            if fp and os.path.normcase(fp) == os.path.normcase(abs_path):
+                candidates.append(im)
+        except Exception:
+            pass
+
+    if candidates:
+        # Prefer non-UDIM image.
+        for im in candidates:
+            if not _is_udim_image(im):
+                return im
+        return candidates[-1]
+
+    return None
+
+
+def _load_single_tile_image(abs_path: str, cache: dict[str, bpy.types.Image]) -> bpy.types.Image | None:
+    key = os.path.normcase(abs_path)
+    if key in cache:
+        return cache[key]
+
+    img = None
+
+    # Prefer operator open with UDIM detection disabled.
+    try:
+        img = _try_open_image_no_udim(abs_path)
+    except Exception:
+        img = None
+
+    if img is not None:
+        _force_image_single_file(img, abs_path)
+        cache[key] = img
+        return img
+
+    try:
+        img = bpy.data.images.load(abs_path, check_existing=False)
+    except Exception:
+        img = None
+
+    if img is not None:
+        _force_image_single_file(img, abs_path)
+
+    if img is not None:
+        cache[key] = img
+    return img
+
+
+def _insert_mapping_offset_for_image_node(nodes, links, image_node: bpy.types.Node, tile_u: int, tile_v: int, uv_map_name: str | None):
+    if image_node is None:
+        return
+
+    vec_input = image_node.inputs.get('Vector')
+    if vec_input is None:
+        return
+
+    mapping_node = nodes.new('ShaderNodeMapping')
+    mapping_node.name = "UMA_UDIM_Mapping"
+    mapping_node.label = "UMA UDIM Offset"
+    try:
+        mapping_node.vector_type = 'POINT'
+    except Exception:
+        pass
+    try:
+        mapping_node.inputs['Location'].default_value[0] = -float(tile_u)
+        mapping_node.inputs['Location'].default_value[1] = -float(tile_v)
+        mapping_node.inputs['Location'].default_value[2] = 0.0
+    except Exception:
+        pass
+
+    # Wire: existing_vector -> mapping -> image
+    if vec_input.is_linked and vec_input.links:
+        existing_link = vec_input.links[0]
+        from_socket = existing_link.from_socket
+        links.remove(existing_link)
+        links.new(from_socket, mapping_node.inputs['Vector'])
+    else:
+        if uv_map_name:
+            uv_node = nodes.new('ShaderNodeUVMap')
+            uv_node.uv_map = uv_map_name
+            uv_out = uv_node.outputs.get('UV')
+            if uv_out is not None:
+                links.new(uv_out, mapping_node.inputs['Vector'])
+        else:
+            texcoord = nodes.new('ShaderNodeTexCoord')
+            uv_out = texcoord.outputs.get('UV')
+            if uv_out is not None:
+                links.new(uv_out, mapping_node.inputs['Vector'])
+
+    out_vec = mapping_node.outputs.get('Vector')
+    if out_vec is not None:
+        links.new(out_vec, vec_input)
+
+
+def _convert_material_to_single_udim_tile(mat: bpy.types.Material, udim_number: int, tile_u: int, tile_v: int, uv_map_name: str | None, image_cache: dict[str, bpy.types.Image] | None = None):
+    if mat is None or not mat.use_nodes or mat.node_tree is None:
+        return (0, 0)
+
+    converted = 0
+    missing = 0
+    nodes = mat.node_tree.nodes
+    links = mat.node_tree.links
+
+    for node in nodes:
+        if getattr(node, "type", None) != 'TEX_IMAGE':
+            continue
+
+        img = getattr(node, "image", None)
+        if img is None:
+            continue
+        if getattr(img, "source", None) != 'TILED':
+            continue
+
+        tile = None
+        try:
+            tile = next((t for t in img.tiles if t.number == udim_number), None)
+        except Exception:
+            tile = None
+
+        tile_path = None
+        if tile is not None:
+            tile_path = getattr(tile, "filepath", None) or getattr(tile, "path", None)
+
+        if not tile_path:
+            missing += 1
+            continue
+
+        abs_path = bpy.path.abspath(tile_path)
+        if not abs_path or not os.path.exists(abs_path):
+            missing += 1
+            continue
+
+        try:
+            cache = image_cache if image_cache is not None else {}
+            new_img = _load_single_tile_image(abs_path, cache)
+            if new_img is None:
+                missing += 1
+                continue
+            node.image = new_img
+            _insert_mapping_offset_for_image_node(nodes, links, node, tile_u, tile_v, uv_map_name)
+            converted += 1
+        except Exception:
+            missing += 1
+
+    return (converted, missing)
+
+
+def _clone_material_for_udim_tile(original: bpy.types.Material, udim_number: int, tile_u: int, tile_v: int, uv_map_name: str | None, image_cache: dict[str, bpy.types.Image]):
+    if original is None:
+        return None
+
+    clone = original.copy()
+    clone.name = _unique_material_name(f"{original.name}_UDIM{udim_number}")
+    clone["uma_udim_split"] = True
+    clone["uma_udim_original"] = original.name
+    clone["uma_udim_tile"] = int(udim_number)
+    clone["uma_udim_tile_u"] = int(tile_u)
+    clone["uma_udim_tile_v"] = int(tile_v)
+
+    converted, missing = _convert_material_to_single_udim_tile(clone, udim_number, tile_u, tile_v, uv_map_name, image_cache=image_cache)
+    return (clone, converted, missing)
+
+
+def _get_object_active_uv_name(mesh_obj: bpy.types.Object) -> str | None:
+    if mesh_obj is None or mesh_obj.type != 'MESH' or mesh_obj.data is None:
+        return None
+    uv_layers = getattr(mesh_obj.data, "uv_layers", None)
+    if not uv_layers:
+        return None
+    active = getattr(uv_layers, "active", None)
+    if active is not None and getattr(active, "name", None):
+        return active.name
+    if len(uv_layers) > 0:
+        return uv_layers[0].name
+    return None
 
 
 def _uma_default_export_path(suffix):
@@ -59,6 +411,144 @@ def _swap_left_right_name(name: str) -> str:
     if name.startswith("Right"):
         return "Left" + name[5:]
     return name
+
+
+def _get_nonzero_vertex_group_names(mesh_obj: bpy.types.Object):
+    if mesh_obj is None or mesh_obj.type != 'MESH':
+        return []
+
+    used_groups = set()
+    for v in mesh_obj.data.vertices:
+        for g in v.groups:
+            if g.weight > 0.0:
+                used_groups.add(g.group)
+
+    names = []
+    for idx in sorted(used_groups):
+        if 0 <= idx < len(mesh_obj.vertex_groups):
+            names.append(mesh_obj.vertex_groups[idx].name)
+    return names
+
+
+def _clear_vertex_groups(context, mesh_obj: bpy.types.Object):
+    if mesh_obj is None or mesh_obj.type != 'MESH':
+        return 0
+
+    _ensure_object_mode(context, mesh_obj)
+
+    removed = 0
+    for idx in range(len(mesh_obj.vertex_groups) - 1, -1, -1):
+        mesh_obj.vertex_groups.remove(mesh_obj.vertex_groups[idx])
+        removed += 1
+
+    return removed
+
+
+def _remove_empty_vertex_groups(mesh_obj: bpy.types.Object):
+    if mesh_obj is None or mesh_obj.type != 'MESH' or mesh_obj.data is None:
+        return 0
+
+    used_groups = set()
+    for vertex in mesh_obj.data.vertices:
+        for group in vertex.groups:
+            if group.weight > 0.0001:
+                used_groups.add(group.group)
+
+    removed = 0
+    for idx in range(len(mesh_obj.vertex_groups) - 1, -1, -1):
+        if idx not in used_groups:
+            mesh_obj.vertex_groups.remove(mesh_obj.vertex_groups[idx])
+            removed += 1
+
+    return removed
+
+
+def _remove_negligible_vertex_weights(context, mesh_obj: bpy.types.Object, max_weight: float = 0.001):
+    if mesh_obj is None or mesh_obj.type != 'MESH' or mesh_obj.data is None:
+        return 0
+
+    _ensure_object_mode(context, mesh_obj)
+
+    removed = 0
+    for vertex_group in list(mesh_obj.vertex_groups):
+        remove_indices = []
+        for vertex in mesh_obj.data.vertices:
+            for assignment in vertex.groups:
+                if assignment.group == vertex_group.index and assignment.weight <= max_weight:
+                    remove_indices.append(vertex.index)
+                    break
+
+        if remove_indices:
+            vertex_group.remove(remove_indices)
+            removed += len(remove_indices)
+
+    return removed
+
+
+def _smooth_vertex_group_weights(context, mesh_obj: bpy.types.Object, factor: float = 0.25):
+    if mesh_obj is None or mesh_obj.type != 'MESH' or mesh_obj.data is None:
+        return (0, 0)
+
+    _ensure_object_mode(context, mesh_obj)
+
+    vertices = mesh_obj.data.vertices
+    if not vertices or not mesh_obj.vertex_groups:
+        return (0, 0)
+
+    neighbors = [[] for _ in range(len(vertices))]
+    for edge in mesh_obj.data.edges:
+        v1, v2 = edge.vertices
+        neighbors[v1].append(v2)
+        neighbors[v2].append(v1)
+
+    groups = list(mesh_obj.vertex_groups)
+    if not groups:
+        return (0, 0)
+
+    original_totals = [0.0] * len(vertices)
+    smoothed_weights = {group.index: [0.0] * len(vertices) for group in groups}
+
+    for vertex in vertices:
+        for assignment in vertex.groups:
+            if assignment.group not in smoothed_weights:
+                continue
+            smoothed_weights[assignment.group][vertex.index] = assignment.weight
+            original_totals[vertex.index] += assignment.weight
+
+    for group in groups:
+        weights = smoothed_weights[group.index]
+        updated = [0.0] * len(vertices)
+
+        for vertex in vertices:
+            current_weight = weights[vertex.index]
+            vertex_neighbors = neighbors[vertex.index]
+            if vertex_neighbors:
+                neighbor_avg = sum(weights[neighbor_index] for neighbor_index in vertex_neighbors) / len(vertex_neighbors)
+                updated[vertex.index] = ((1.0 - factor) * current_weight) + (factor * neighbor_avg)
+            else:
+                updated[vertex.index] = current_weight
+
+        smoothed_weights[group.index] = updated
+
+    normalized_vertices = 0
+    for vertex in vertices:
+        original_total = original_totals[vertex.index]
+        new_total = sum(smoothed_weights[group.index][vertex.index] for group in groups)
+
+        if original_total > 0.0 and new_total > 0.0:
+            scale = original_total / new_total
+            normalized_vertices += 1
+        else:
+            scale = 0.0
+
+        for group in groups:
+            weight = smoothed_weights[group.index][vertex.index] * scale
+            if weight > 0.0001:
+                group.add([vertex.index], weight, 'REPLACE')
+            else:
+                group.remove([vertex.index])
+
+    return (len(groups), normalized_vertices)
 
 
 def _on_quick_select_index_update(self, context):
@@ -182,6 +672,28 @@ def _refresh_report_text(context, lines):
     else:
         item = wm.uma_tools_report_lines.add()
         item.text = "No issues found."
+
+
+def _get_transform_object_name_from_line(line: str):
+    if not line or not line.startswith("TRANSFORM:"):
+        return None
+    start = line.find("'")
+    end = line.find("'", start + 1) if start >= 0 else -1
+    if start >= 0 and end > start:
+        return line[start + 1:end]
+    return None
+
+
+def _get_missing_armature_object_name_from_line(line: str):
+    if not line or not line.startswith("MESH:"):
+        return None
+    if "missing an Armature modifier" not in line:
+        return None
+    start = line.find("'")
+    end = line.find("'", start + 1) if start >= 0 else -1
+    if start >= 0 and end > start:
+        return line[start + 1:end]
+    return None
 
 
 class UMA_OT_tools_check_errors(bpy.types.Operator):
@@ -319,6 +831,8 @@ class UMA_OT_tools_copy_weights_to_selected(bpy.types.Operator):
         wm = context.window_manager
         scene = context.scene
         source = getattr(wm, "uma_tools_weights_source", None)
+        smooth_weights = getattr(wm, "uma_tools_smooth_weights", False)
+        mapping = getattr(wm, "uma_tools_weight_mapping", 'POLYINTERP_NEAREST')
         if source is None or source.type != 'MESH':
             self.report({'WARNING'}, "Pick a mesh source object for weights")
             return {'CANCELLED'}
@@ -328,11 +842,20 @@ class UMA_OT_tools_copy_weights_to_selected(bpy.types.Operator):
             self.report({'WARNING'}, "No target meshes selected")
             return {'CANCELLED'}
 
+        source_groups = _get_nonzero_vertex_group_names(source)
+
         prev_active = context.view_layer.objects.active
         prev_sel = _get_selected_objects(context)
+        removed_empty_total = 0
 
         try:
             for obj in targets:
+                _clear_vertex_groups(context, obj)
+
+                for group_name in source_groups:
+                    if obj.vertex_groups.get(group_name) is None:
+                        obj.vertex_groups.new(name=group_name)
+
                 # Create Data Transfer modifier
                 mod = obj.modifiers.new(name="UMA_CopyWeights", type='DATA_TRANSFER')
                 mod.object = source
@@ -342,7 +865,7 @@ class UMA_OT_tools_copy_weights_to_selected(bpy.types.Operator):
                 mod.data_types_verts = {'VGROUP_WEIGHTS'}
 
                 # Mapping as requested
-                mod.vert_mapping = 'POLY_NEAREST'
+                mod.vert_mapping = mapping
 
                 # Mix settings
                 mod.mix_mode = 'REPLACE'
@@ -354,6 +877,11 @@ class UMA_OT_tools_copy_weights_to_selected(bpy.types.Operator):
                 context.view_layer.objects.active = obj
                 bpy.ops.object.modifier_apply(modifier=mod.name)
 
+                if smooth_weights:
+                    _smooth_vertex_group_weights(context, obj, factor=0.25)
+
+                removed_empty_total += _remove_empty_vertex_groups(obj)
+
         except RuntimeError as e:
             self.report({'ERROR'}, f"Copy weights failed: {str(e)}")
             return {'CANCELLED'}
@@ -364,7 +892,10 @@ class UMA_OT_tools_copy_weights_to_selected(bpy.types.Operator):
                     o.select_set(True)
             context.view_layer.objects.active = prev_active
 
-        self.report({'INFO'}, f"Copied weights from '{source.name}' to {len(targets)} mesh(es)")
+        if smooth_weights:
+            self.report({'INFO'}, f"Copied and smoothed weights from '{source.name}' to {len(targets)} mesh(es), removed {removed_empty_total} empty vertex group(s)")
+        else:
+            self.report({'INFO'}, f"Copied weights from '{source.name}' to {len(targets)} mesh(es), removed {removed_empty_total} empty vertex group(s)")
         return {'FINISHED'}
 
 
@@ -417,20 +948,138 @@ class UMA_OT_tools_remove_empty_vertex_groups(bpy.types.Operator):
         removed_total = 0
 
         for obj in targets:
-            # Build set of groups that have any non-zero weight.
-            used_groups = set()
-            for v in obj.data.vertices:
-                for g in v.groups:
-                    if g.weight > 0.0:
-                        used_groups.add(g.group)
-
-            # Remove groups (iterate in reverse to keep indices stable).
-            for idx in range(len(obj.vertex_groups) - 1, -1, -1):
-                if idx not in used_groups:
-                    obj.vertex_groups.remove(obj.vertex_groups[idx])
-                    removed_total += 1
+            removed_total += _remove_empty_vertex_groups(obj)
 
         self.report({'INFO'}, f"Removed {removed_total} empty vertex group(s)")
+        return {'FINISHED'}
+
+
+class UMA_OT_tools_remove_negligible_weights(bpy.types.Operator):
+    bl_idname = "uma_tools.remove_negligible_weights"
+    bl_label = "Remove negligible weights"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        targets = [o for o in context.selected_objects if o is not None and o.type == 'MESH']
+        if not targets:
+            self.report({'WARNING'}, "No mesh objects selected")
+            return {'CANCELLED'}
+
+        removed_total = 0
+        for obj in targets:
+            removed_total += _remove_negligible_vertex_weights(context, obj, max_weight=0.001)
+
+        self.report({'INFO'}, f"Removed {removed_total} negligible weight assignment(s)")
+        return {'FINISHED'}
+
+
+def _normalize_vertex_weights_for_indices(obj: bpy.types.Object, vertex_indices):
+    normalized = 0
+    skipped = 0
+
+    for idx in vertex_indices:
+        vert = obj.data.vertices[idx]
+        weighted_groups = [g for g in vert.groups if g.weight > 0.0 and g.group < len(obj.vertex_groups)]
+        total = sum(g.weight for g in weighted_groups)
+
+        if total <= 0.0:
+            skipped += 1
+            continue
+
+        for g in weighted_groups:
+            vg = obj.vertex_groups[g.group]
+            vg.add([idx], g.weight / total, 'REPLACE')
+
+        normalized += 1
+
+    return normalized, skipped
+
+
+class UMA_OT_tools_normalize_selected_weights(bpy.types.Operator):
+    bl_idname = "uma_tools.normalize_selected_weights"
+    bl_label = "Normalize selected"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        obj = context.view_layer.objects.active
+        if obj is None or obj.type != 'MESH':
+            self.report({'WARNING'}, "Select a mesh object")
+            return {'CANCELLED'}
+
+        initial_mode = obj.mode
+
+        # Read selected vertices first (especially when coming from Edit Mode).
+        if initial_mode == 'EDIT':
+            bm = bmesh.from_edit_mesh(obj.data)
+            selected_indices = [v.index for v in bm.verts if v.select]
+        else:
+            selected_indices = [v.index for v in obj.data.vertices if v.select]
+
+        if not selected_indices:
+            self.report({'WARNING'}, "No selected vertices found")
+            return {'CANCELLED'}
+
+        normalized = 0
+        skipped = 0
+
+        try:
+            if obj.mode != 'OBJECT':
+                bpy.ops.object.mode_set(mode='OBJECT')
+            normalized, skipped = _normalize_vertex_weights_for_indices(obj, selected_indices)
+
+        except RuntimeError as e:
+            self.report({'ERROR'}, f"Normalize selected failed: {str(e)}")
+            return {'CANCELLED'}
+        finally:
+            if obj.mode != initial_mode:
+                try:
+                    bpy.ops.object.mode_set(mode=initial_mode)
+                except Exception:
+                    pass
+
+        if skipped:
+            self.report({'INFO'}, f"Normalized {normalized} vertex(es); skipped {skipped} without weights")
+        else:
+            self.report({'INFO'}, f"Normalized {normalized} vertex(es)")
+        return {'FINISHED'}
+
+
+class UMA_OT_tools_normalize_all_weights(bpy.types.Operator):
+    bl_idname = "uma_tools.normalize_all_weights"
+    bl_label = "Normalize all"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        obj = context.view_layer.objects.active
+        if obj is None or obj.type != 'MESH':
+            self.report({'WARNING'}, "Select a mesh object")
+            return {'CANCELLED'}
+
+        initial_mode = obj.mode
+        all_indices = [v.index for v in obj.data.vertices]
+        if not all_indices:
+            self.report({'WARNING'}, "Active mesh has no vertices")
+            return {'CANCELLED'}
+
+        try:
+            if obj.mode != 'OBJECT':
+                bpy.ops.object.mode_set(mode='OBJECT')
+            normalized, skipped = _normalize_vertex_weights_for_indices(obj, all_indices)
+
+        except RuntimeError as e:
+            self.report({'ERROR'}, f"Normalize all failed: {str(e)}")
+            return {'CANCELLED'}
+        finally:
+            if obj.mode != initial_mode:
+                try:
+                    bpy.ops.object.mode_set(mode=initial_mode)
+                except Exception:
+                    pass
+
+        if skipped:
+            self.report({'INFO'}, f"Normalized {normalized} vertex(es); skipped {skipped} without weights")
+        else:
+            self.report({'INFO'}, f"Normalized {normalized} vertex(es)")
         return {'FINISHED'}
 
 
@@ -751,6 +1400,31 @@ class UMA_OT_tools_unselect_all_vertices(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class UMA_OT_tools_cursor_move_to_origin(bpy.types.Operator):
+    bl_idname = "uma_tools.cursor_move_to_origin"
+    bl_label = "Move to Origin"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        context.scene.cursor.location = (0.0, 0.0, 0.0)
+        return {'FINISHED'}
+
+
+class UMA_OT_tools_cursor_align_with_object(bpy.types.Operator):
+    bl_idname = "uma_tools.cursor_align_with_object"
+    bl_label = "Align with Object"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        obj = context.view_layer.objects.active
+        if obj is None:
+            self.report({'WARNING'}, "Select an object to align the 3D Cursor")
+            return {'CANCELLED'}
+
+        context.scene.cursor.location = obj.matrix_world.translation
+        return {'FINISHED'}
+
+
 class UMA_OT_tools_remove_vertex_group_quick_select(bpy.types.Operator):
     bl_idname = "uma_tools.remove_vertex_group_quick_select"
     bl_label = "Remove"
@@ -814,6 +1488,129 @@ class UMA_OT_tools_fix_transforms(bpy.types.Operator):
 
         # Re-run checks after fix
         bpy.ops.uma_tools.check_errors(selected_only=self.selected_only)
+        return {'FINISHED'}
+
+
+class UMA_OT_tools_fix_transform_from_report(bpy.types.Operator):
+    bl_idname = "uma_tools.fix_transform_from_report"
+    bl_label = "Fix transform"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    mode: bpy.props.EnumProperty(
+        items=(
+            ("SELECTED", "Selected", "Fix selected report item"),
+            ("ALL", "All", "Fix all transform report items"),
+        ),
+        default="SELECTED",
+    )
+
+    def _apply_transform(self, context, obj):
+        if obj is None or obj.type not in {'MESH', 'ARMATURE'}:
+            return False
+        if not _needs_transform_apply(obj):
+            return False
+
+        prev_active = context.view_layer.objects.active
+        prev_sel = _get_selected_objects(context)
+        try:
+            _deselect_all_objects(context)
+            obj.select_set(True)
+            context.view_layer.objects.active = obj
+            bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
+        except RuntimeError:
+            return False
+        finally:
+            _deselect_all_objects(context)
+            for o in prev_sel:
+                if o and o.name in context.scene.objects:
+                    o.select_set(True)
+            context.view_layer.objects.active = prev_active
+
+        return True
+
+    def execute(self, context):
+        wm = context.window_manager
+        lines = wm.uma_tools_report_lines
+
+        if not lines:
+            self.report({'WARNING'}, "No report items")
+            return {'CANCELLED'}
+
+        targets = []
+        if self.mode == "SELECTED":
+            if not (0 <= wm.uma_tools_report_index < len(lines)):
+                self.report({'WARNING'}, "No report item selected")
+                return {'CANCELLED'}
+            name = _get_transform_object_name_from_line(lines[wm.uma_tools_report_index].text)
+            if name:
+                obj = context.scene.objects.get(name)
+                if obj is not None:
+                    targets.append(obj)
+        else:
+            seen = set()
+            for item in lines:
+                name = _get_transform_object_name_from_line(item.text)
+                if name and name not in seen:
+                    obj = context.scene.objects.get(name)
+                    if obj is not None:
+                        targets.append(obj)
+                        seen.add(name)
+
+        if not targets:
+            self.report({'WARNING'}, "No transform items to fix")
+            return {'CANCELLED'}
+
+        fixed = 0
+        for obj in targets:
+            if self._apply_transform(context, obj):
+                fixed += 1
+
+        bpy.ops.uma_tools.check_errors(selected_only=False)
+        self.report({'INFO'}, f"Fixed transforms on {fixed} object(s)")
+        return {'FINISHED'}
+
+
+class UMA_OT_tools_fix_missing_armature_modifiers(bpy.types.Operator):
+    bl_idname = "uma_tools.fix_missing_armature_modifiers"
+    bl_label = "Fix all missing Armature"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        wm = context.window_manager
+        lines = wm.uma_tools_report_lines
+        if not lines:
+            self.report({'WARNING'}, "No report items")
+            return {'CANCELLED'}
+
+        root = context.scene.objects.get("Root")
+        if root is None or root.type != 'ARMATURE':
+            self.report({'ERROR'}, "Armature object named 'Root' not found")
+            return {'CANCELLED'}
+
+        targets = []
+        seen = set()
+        for item in lines:
+            name = _get_missing_armature_object_name_from_line(item.text)
+            if name and name not in seen:
+                obj = context.scene.objects.get(name)
+                if obj is not None and obj.type == 'MESH':
+                    targets.append(obj)
+                    seen.add(name)
+
+        if not targets:
+            self.report({'WARNING'}, "No missing Armature modifier items to fix")
+            return {'CANCELLED'}
+
+        fixed = 0
+        for obj in targets:
+            if _has_armature_modifier(obj):
+                continue
+            mod = obj.modifiers.new(name="Armature", type='ARMATURE')
+            mod.object = root
+            fixed += 1
+
+        bpy.ops.uma_tools.check_errors(selected_only=False)
+        self.report({'INFO'}, f"Added Armature modifier to {fixed} object(s)")
         return {'FINISHED'}
 
 
@@ -971,6 +1768,253 @@ class UMA_OT_tools_fbx_export_selected(bpy.types.Operator):
         return {'RUNNING_MODAL'}
 
 
+class UMA_OT_tools_split_udims_to_textures(bpy.types.Operator):
+    bl_idname = "uma_tools.split_udims_to_textures"
+    bl_label = "Split UDIMS into separate textures"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        targets = [o for o in context.selected_objects if o is not None and o.type == 'MESH']
+        if not targets:
+            self.report({'WARNING'}, "No mesh objects selected")
+            return {'CANCELLED'}
+
+        prev_active = context.view_layer.objects.active
+        prev_selected = _get_selected_objects(context)
+
+        created_mats = 0
+        reassigned_faces = 0
+        converted_nodes = 0
+        missing_tiles = 0
+        multi_tile_faces = 0
+        image_cache: dict[str, bpy.types.Image] = {}
+
+        try:
+            for obj in targets:
+                if obj.data is None:
+                    continue
+
+                _ensure_object_mode(context, obj)
+
+                uv_name = _get_object_active_uv_name(obj)
+                if not uv_name:
+                    self.report({'WARNING'}, f"'{obj.name}' has no UV layers; skipping")
+                    continue
+                uv_layer = obj.data.uv_layers.get(uv_name)
+                if uv_layer is None:
+                    continue
+
+                polys = obj.data.polygons
+                if not polys:
+                    continue
+
+                slot_materials = list(obj.data.materials)
+                if not slot_materials:
+                    continue
+
+                # Cache: (orig_material_name, udim_number) -> slot_index
+                new_slot_by_key: dict[tuple[str, int], int] = {}
+
+                for slot_index, mat in enumerate(slot_materials):
+                    if mat is None:
+                        continue
+
+                    tile_to_polys: dict[tuple[int, int], list[int]] = {}
+
+                    for poly in polys:
+                        if poly.material_index != slot_index:
+                            continue
+
+                        loop_uvs = []
+                        for li in poly.loop_indices:
+                            try:
+                                loop_uvs.append(uv_layer.data[li].uv)
+                            except Exception:
+                                pass
+
+                        if not loop_uvs:
+                            continue
+
+                        # Determine the face's UDIM tile from average UV.
+                        u_avg = sum((uv.x for uv in loop_uvs), 0.0) / float(len(loop_uvs))
+                        v_avg = sum((uv.y for uv in loop_uvs), 0.0) / float(len(loop_uvs))
+                        tile_u, tile_v = _udim_tile_from_uv((u_avg, v_avg))
+
+                        # Detect faces spanning multiple tiles (best-effort warning).
+                        tiles_seen = set(_udim_tile_from_uv((uv.x, uv.y)) for uv in loop_uvs)
+                        if len(tiles_seen) > 1:
+                            multi_tile_faces += 1
+
+                        tile_to_polys.setdefault((tile_u, tile_v), []).append(poly.index)
+
+                    if not tile_to_polys:
+                        continue
+
+                    # Create per-tile materials and reassign faces.
+                    for (tile_u, tile_v), poly_indices in tile_to_polys.items():
+                        udim_number = _udim_number_from_tile(tile_u, tile_v)
+                        key = (mat.name, udim_number)
+
+                        if key not in new_slot_by_key:
+                            clone_result = _clone_material_for_udim_tile(mat, udim_number, tile_u, tile_v, uv_name, image_cache)
+                            if not clone_result:
+                                continue
+
+                            clone, cnv, miss = clone_result
+
+                            obj.data.materials.append(clone)
+                            new_slot_index = len(obj.data.materials) - 1
+                            new_slot_by_key[key] = new_slot_index
+                            created_mats += 1
+
+                            converted_nodes += cnv
+                            missing_tiles += miss
+
+                        new_slot_index = new_slot_by_key[key]
+                        for pi in poly_indices:
+                            polys[pi].material_index = new_slot_index
+                        reassigned_faces += len(poly_indices)
+
+                obj.data.update()
+
+        finally:
+            _deselect_all_objects(context)
+            for o in prev_selected:
+                if o and o.name in context.scene.objects:
+                    o.select_set(True)
+            context.view_layer.objects.active = prev_active
+
+        msg = f"Created {created_mats} material(s); reassigned {reassigned_faces} face(s)"
+        if converted_nodes:
+            msg += f"; converted {converted_nodes} tiled image node(s)"
+        if multi_tile_faces:
+            msg += f"; {multi_tile_faces} face(s) spanned multiple tiles (best-effort assigned)"
+        if missing_tiles:
+            msg += f"; {missing_tiles} tiled image node(s) missing tile files"
+        self.report({'INFO'}, msg)
+        return {'FINISHED'}
+
+
+class UMA_OT_tools_reset_to_udim(bpy.types.Operator):
+    bl_idname = "uma_tools.reset_to_udim"
+    bl_label = "Reset to UDIM"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        targets = [o for o in context.selected_objects if o is not None and o.type == 'MESH']
+        if not targets:
+            self.report({'WARNING'}, "No mesh objects selected")
+            return {'CANCELLED'}
+
+        prev_active = context.view_layer.objects.active
+        prev_selected = _get_selected_objects(context)
+
+        restored_faces = 0
+        removed_slots = 0
+        deleted_materials = 0
+        split_materials_to_delete = []
+
+        try:
+            for obj in targets:
+                if obj.data is None:
+                    continue
+
+                _ensure_object_mode(context, obj)
+
+                polys = obj.data.polygons
+                if not polys:
+                    continue
+
+                # Build lookup of current slots -> materials
+                materials = list(obj.data.materials)
+                if not materials:
+                    continue
+
+                for mat in materials:
+                    if mat is None:
+                        continue
+                    if bool(mat.get("uma_udim_split", False)) and mat not in split_materials_to_delete:
+                        split_materials_to_delete.append(mat)
+
+                # Ensure original materials exist in slots when needed.
+                slot_index_by_mat_name: dict[str, int] = {}
+                for idx, mat in enumerate(materials):
+                    if mat is not None:
+                        slot_index_by_mat_name[mat.name] = idx
+
+                # Reassign faces from split clones back to original materials.
+                for slot_index, mat in enumerate(materials):
+                    if mat is None:
+                        continue
+                    if not bool(mat.get("uma_udim_split", False)):
+                        continue
+
+                    original_name = mat.get("uma_udim_original")
+                    if not original_name:
+                        continue
+                    original_mat = bpy.data.materials.get(original_name)
+                    if original_mat is None:
+                        continue
+
+                    if original_mat.name in slot_index_by_mat_name:
+                        original_slot = slot_index_by_mat_name[original_mat.name]
+                    else:
+                        obj.data.materials.append(original_mat)
+                        original_slot = len(obj.data.materials) - 1
+                        slot_index_by_mat_name[original_mat.name] = original_slot
+
+                    for poly in polys:
+                        if poly.material_index == slot_index:
+                            poly.material_index = original_slot
+                            restored_faces += 1
+
+                # Cleanup: remove unused slots (iterate in reverse and remap indices).
+                used = [False] * len(obj.data.materials)
+                for p in polys:
+                    if 0 <= p.material_index < len(used):
+                        used[p.material_index] = True
+
+                for idx in range(len(obj.data.materials) - 1, -1, -1):
+                    if used[idx]:
+                        continue
+
+                    obj.data.materials.pop(idx)
+                    used.pop(idx)
+                    removed_slots += 1
+
+                    for p in polys:
+                        if p.material_index > idx:
+                            p.material_index -= 1
+
+                obj.data.update()
+
+            for mat in split_materials_to_delete:
+                if mat is None:
+                    continue
+                if mat.name not in bpy.data.materials:
+                    continue
+                if getattr(mat, "users", 0) != 0:
+                    continue
+                try:
+                    bpy.data.materials.remove(mat)
+                    deleted_materials += 1
+                except Exception:
+                    pass
+
+        finally:
+            _deselect_all_objects(context)
+            for o in prev_selected:
+                if o and o.name in context.scene.objects:
+                    o.select_set(True)
+            context.view_layer.objects.active = prev_active
+
+        self.report(
+            {'INFO'},
+            f"Restored {restored_faces} face(s); removed {removed_slots} unused slot(s); deleted {deleted_materials} split material(s)",
+        )
+        return {'FINISHED'}
+
+
 class UMA_PT_tools_panel(bpy.types.Panel):
     bl_label = "UMA Tools"
     bl_idname = "UMA_PT_tools_panel"
@@ -1026,6 +2070,10 @@ class UMA_PT_tools_panel(bpy.types.Panel):
                 "uma_tools_report_index",
                 rows=6,
             )
+            row = col.row(align=True)
+            row.operator(UMA_OT_tools_fix_missing_armature_modifiers.bl_idname, text="Fix all missing Armature")
+            op = row.operator(UMA_OT_tools_fix_transform_from_report.bl_idname, text="Fix all transform items")
+            op.mode = "ALL"
             if 0 <= wm.uma_tools_report_index < len(wm.uma_tools_report_lines):
                 sel = wm.uma_tools_report_lines[wm.uma_tools_report_index]
                 col.separator()
@@ -1039,8 +2087,11 @@ class UMA_PT_tools_panel(bpy.types.Panel):
             col = box.column(align=True)
             col.operator(UMA_OT_tools_reset_pose_transforms.bl_idname, text="Reset pose transforms")
             col.operator(UMA_OT_tools_copy_weights_mirrored.bl_idname, text="Copy Weights Mirrored")
+            col.operator(UMA_OT_tools_remove_negligible_weights.bl_idname, text="Remove negligible weights")
             col.separator()
             col.prop(wm, "uma_tools_weights_source", text="Source")
+            col.prop(wm, "uma_tools_smooth_weights", text="Smooth weights")
+            col.prop(wm, "uma_tools_weight_mapping", text="Mapping")
             col.operator(UMA_OT_tools_copy_weights_to_selected.bl_idname, text="Copy weights to all selected")
 
         # Utilities
@@ -1053,6 +2104,8 @@ class UMA_PT_tools_panel(bpy.types.Panel):
             util.operator(UMA_OT_tools_process_rename_selected.bl_idname, text="Process rename on selected")
             util.separator()
             util.operator(UMA_OT_tools_remove_empty_vertex_groups.bl_idname, text="Remove empty vertex groups")
+            util.operator(UMA_OT_tools_normalize_selected_weights.bl_idname, text="Normalize Selected")
+            util.operator(UMA_OT_tools_normalize_all_weights.bl_idname, text="Normalize All")
 
         # Editing Tools
         box = layout.box()
@@ -1079,6 +2132,22 @@ class UMA_PT_tools_panel(bpy.types.Panel):
                 "uma_tools_group_quick_select_index",
                 rows=6,
             )
+
+        # 3D Cursor
+        box = layout.box()
+        _draw_fold_header(box, "uma_tools_section_3d_cursor", "3D Cursor")
+        if wm.uma_tools_section_3d_cursor:
+            cur = box.column(align=True)
+            cur.operator(UMA_OT_tools_cursor_move_to_origin.bl_idname, text="Move to Origin")
+            cur.operator(UMA_OT_tools_cursor_align_with_object.bl_idname, text="Align with Object")
+
+        # UDIM Tools
+        box = layout.box()
+        _draw_fold_header(box, "uma_tools_section_udim_tools", "UDIM Tools")
+        if wm.uma_tools_section_udim_tools:
+            udim = box.column(align=True)
+            udim.operator(UMA_OT_tools_split_udims_to_textures.bl_idname, text="Split UDIMS into separate textures")
+            udim.operator(UMA_OT_tools_reset_to_udim.bl_idname, text="Reset to UDIM")
 
         # UMA Export
         box = layout.box()
@@ -1131,9 +2200,14 @@ classes = (
     UMA_OT_tools_insert_global_position_bones,
     UMA_OT_tools_select_all,
     UMA_OT_tools_fix_transforms,
+    UMA_OT_tools_fix_transform_from_report,
+    UMA_OT_tools_fix_missing_armature_modifiers,
     UMA_OT_tools_copy_weights_to_selected,
     UMA_OT_tools_process_rename_selected,
     UMA_OT_tools_remove_empty_vertex_groups,
+    UMA_OT_tools_remove_negligible_weights,
+    UMA_OT_tools_normalize_selected_weights,
+    UMA_OT_tools_normalize_all_weights,
     UMA_OT_tools_reset_pose_transforms,
     UMA_OT_tools_select_edge_loops,
     UMA_OT_tools_copy_weights_mirrored,
@@ -1142,9 +2216,13 @@ classes = (
     UMA_OT_tools_select_vertex_group_opposite,
     UMA_OT_tools_select_all_vertices,
     UMA_OT_tools_unselect_all_vertices,
+    UMA_OT_tools_cursor_move_to_origin,
+    UMA_OT_tools_cursor_align_with_object,
     UMA_OT_tools_remove_vertex_group_quick_select,
     UMA_OT_tools_fbx_export_all,
     UMA_OT_tools_fbx_export_selected,
+    UMA_OT_tools_split_udims_to_textures,
+    UMA_OT_tools_reset_to_udim,
     UMA_PT_tools_panel,
 )
 
@@ -1203,6 +2281,37 @@ def register():
         type=bpy.types.Object,
     )
 
+    if hasattr(bpy.types.WindowManager, "uma_tools_smooth_weights"):
+        try:
+            del bpy.types.WindowManager.uma_tools_smooth_weights
+        except Exception:
+            pass
+    bpy.types.WindowManager.uma_tools_smooth_weights = bpy.props.BoolProperty(
+        name="Smooth weights",
+        description="Blend copied vertex weights with neighboring vertices using gentle smoothing",
+        default=False,
+    )
+
+    if hasattr(bpy.types.WindowManager, "uma_tools_weight_mapping"):
+        try:
+            del bpy.types.WindowManager.uma_tools_weight_mapping
+        except Exception:
+            pass
+    bpy.types.WindowManager.uma_tools_weight_mapping = bpy.props.EnumProperty(
+        name="Mapping",
+        description="Vertex mapping mode used by the Data Transfer modifier when copying weights",
+        items=[
+            ('TOPOLOGY', "Topology", "Copy from identical topology meshes"),
+            ('NEAREST', "Nearest Vertex", "Copy from closest vertex"),
+            ('EDGE_NEAREST', "Nearest Edge Vertex", "Copy from closest vertex of closest edge"),
+            ('EDGEINTERP_NEAREST', "Nearest Edge Interpolated", "Copy from interpolated values of vertices from closest point on closest edge"),
+            ('POLY_NEAREST', "Nearest Face Vertex", "Copy from closest vertex of closest face"),
+            ('POLYINTERP_NEAREST', "Nearest Face Interpolated", "Copy from interpolated values of vertices from closest point on closest face"),
+            ('POLYINTERP_VNORPROJ', "Projected Face Interpolated", "Copy from interpolated values of vertices from point on closest face hit by normal-projection"),
+        ],
+        default='POLYINTERP_NEAREST',
+    )
+
     if hasattr(bpy.types.WindowManager, "uma_tools_rename_prepend"):
         try:
             del bpy.types.WindowManager.uma_tools_rename_prepend
@@ -1229,9 +2338,11 @@ def register():
     for prop_name, default in (
         ("uma_tools_section_error_checking", True),
         ("uma_tools_section_copy_weights", False),
-        ("uma_tools_section_utilities", False),
+        ("uma_tools_section_utilities", True),
         ("uma_tools_section_editing_tools", False),
         ("uma_tools_section_vertex_group_quick_select", False),
+        ("uma_tools_section_3d_cursor", False),
+        ("uma_tools_section_udim_tools", False),
         ("uma_tools_section_export", True),
     ):
         if hasattr(bpy.types.WindowManager, prop_name):
@@ -1275,6 +2386,18 @@ def unregister():
         except Exception:
             pass
 
+    if hasattr(bpy.types.WindowManager, "uma_tools_smooth_weights"):
+        try:
+            del bpy.types.WindowManager.uma_tools_smooth_weights
+        except Exception:
+            pass
+
+    if hasattr(bpy.types.WindowManager, "uma_tools_weight_mapping"):
+        try:
+            del bpy.types.WindowManager.uma_tools_weight_mapping
+        except Exception:
+            pass
+
     if hasattr(bpy.types.WindowManager, "uma_tools_rename_prepend"):
         try:
             del bpy.types.WindowManager.uma_tools_rename_prepend
@@ -1292,6 +2415,8 @@ def unregister():
         "uma_tools_section_utilities",
         "uma_tools_section_editing_tools",
         "uma_tools_section_vertex_group_quick_select",
+        "uma_tools_section_3d_cursor",
+        "uma_tools_section_udim_tools",
         "uma_tools_section_export",
     ):
         if hasattr(bpy.types.WindowManager, prop_name):
