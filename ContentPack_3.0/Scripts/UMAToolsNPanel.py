@@ -385,6 +385,49 @@ def _uma_default_export_path(suffix):
     return os.path.join(os.path.expanduser("~"), "uma" + suffix + ".fbx")
 
 
+def _uma_fbx_export_kwargs(context, use_selection: bool):
+    use_uma_2_format = getattr(context.window_manager, "uma_tools_export_uma2_format", False)
+    axis_forward = 'Z' if use_uma_2_format else '-Z'
+    axis_up = 'Y'
+    primary_bone_axis = 'X' if use_uma_2_format else 'Y'
+    secondary_bone_axis = '-Y' if use_uma_2_format else 'X'
+
+    return {
+        "use_selection": use_selection,
+        "use_active_collection": False,
+        "global_scale": 1.0,
+        "apply_unit_scale": True,
+        "apply_scale_options": 'FBX_SCALE_ALL',
+        "bake_space_transform": False,
+        "object_types": {'ARMATURE', 'MESH', 'EMPTY'},
+        "use_mesh_modifiers": True,
+        "use_mesh_modifiers_render": True,
+        "mesh_smooth_type": 'OFF',
+        "use_subsurf": False,
+        "use_mesh_edges": False,
+        "use_tspace": False,
+        "use_custom_props": False,
+        "add_leaf_bones": True,
+        "primary_bone_axis": primary_bone_axis,
+        "secondary_bone_axis": secondary_bone_axis,
+        "armature_nodetype": 'NULL',
+        "bake_anim": False,
+        "bake_anim_use_all_bones": True,
+        "bake_anim_use_nla_strips": True,
+        "bake_anim_use_all_actions": True,
+        "bake_anim_force_startend_keying": True,
+        "bake_anim_step": 1.0,
+        "bake_anim_simplify_factor": 1.0,
+        "path_mode": 'COPY',
+        "embed_textures": True,
+        "batch_mode": 'OFF',
+        "use_batch_own_dir": True,
+        "use_metadata": True,
+        "axis_forward": axis_forward,
+        "axis_up": axis_up,
+    }
+
+
 def _iter_target_objects(context, selected_only: bool):
     if selected_only:
         objs = list(context.selected_objects)
@@ -1653,41 +1696,7 @@ class UMA_OT_tools_fbx_export_all(bpy.types.Operator):
             self.filepath += '.fbx'
 
         try:
-            bpy.ops.export_scene.fbx(
-                filepath=self.filepath,
-                use_selection=False,
-                use_active_collection=False,
-                global_scale=1.0,
-                apply_unit_scale=True,
-                apply_scale_options='FBX_SCALE_ALL',
-                bake_space_transform=False,
-                object_types={'ARMATURE', 'MESH', 'EMPTY'},
-                use_mesh_modifiers=True,
-                use_mesh_modifiers_render=True,
-                mesh_smooth_type='OFF',
-                use_subsurf=False,
-                use_mesh_edges=False,
-                use_tspace=False,
-                use_custom_props=False,
-                add_leaf_bones=True,
-                primary_bone_axis='Y',
-                secondary_bone_axis='X',
-                armature_nodetype='NULL',
-                bake_anim=False,
-                bake_anim_use_all_bones=True,
-                bake_anim_use_nla_strips=True,
-                bake_anim_use_all_actions=True,
-                bake_anim_force_startend_keying=True,
-                bake_anim_step=1.0,
-                bake_anim_simplify_factor=1.0,
-                path_mode='COPY',
-                embed_textures=True,
-                batch_mode='OFF',
-                use_batch_own_dir=True,
-                use_metadata=True,
-                axis_forward='-Z',
-                axis_up='Y'
-            )
+            bpy.ops.export_scene.fbx(filepath=self.filepath, **_uma_fbx_export_kwargs(context, use_selection=False))
             self.report({'INFO'}, f"Exported FBX: {os.path.basename(self.filepath)}")
             return {'FINISHED'}
         except Exception as e:
@@ -1721,41 +1730,7 @@ class UMA_OT_tools_fbx_export_selected(bpy.types.Operator):
             self.filepath += '.fbx'
 
         try:
-            bpy.ops.export_scene.fbx(
-                filepath=self.filepath,
-                use_selection=True,
-                use_active_collection=False,
-                global_scale=1.0,
-                apply_unit_scale=True,
-                apply_scale_options='FBX_SCALE_ALL',
-                bake_space_transform=False,
-                object_types={'ARMATURE', 'MESH', 'EMPTY'},
-                use_mesh_modifiers=True,
-                use_mesh_modifiers_render=True,
-                mesh_smooth_type='OFF',
-                use_subsurf=False,
-                use_mesh_edges=False,
-                use_tspace=False,
-                use_custom_props=False,
-                add_leaf_bones=True,
-                primary_bone_axis='Y',
-                secondary_bone_axis='X',
-                armature_nodetype='NULL',
-                bake_anim=False,
-                bake_anim_use_all_bones=True,
-                bake_anim_use_nla_strips=True,
-                bake_anim_use_all_actions=True,
-                bake_anim_force_startend_keying=True,
-                bake_anim_step=1.0,
-                bake_anim_simplify_factor=1.0,
-                path_mode='COPY',
-                embed_textures=True,
-                batch_mode='OFF',
-                use_batch_own_dir=True,
-                use_metadata=True,
-                axis_forward='-Z',
-                axis_up='Y'
-            )
+            bpy.ops.export_scene.fbx(filepath=self.filepath, **_uma_fbx_export_kwargs(context, use_selection=True))
             self.report({'INFO'}, f"Exported FBX: {os.path.basename(self.filepath)}")
             return {'FINISHED'}
         except Exception as e:
@@ -2153,6 +2128,7 @@ class UMA_PT_tools_panel(bpy.types.Panel):
         box = layout.box()
         _draw_fold_header(box, "uma_tools_section_export", "UMA Export")
         if wm.uma_tools_section_export:
+            box.prop(wm, "uma_tools_export_uma2_format", text="UMA 2 Format")
             box.operator_context = 'INVOKE_DEFAULT'
             box.operator(UMA_OT_tools_fbx_export_all.bl_idname, text="Export FBX (All)")
             box.operator(UMA_OT_tools_fbx_export_selected.bl_idname, text="Export FBX (Selected)")
@@ -2312,6 +2288,17 @@ def register():
         default='POLYINTERP_NEAREST',
     )
 
+    if hasattr(bpy.types.WindowManager, "uma_tools_export_uma2_format"):
+        try:
+            del bpy.types.WindowManager.uma_tools_export_uma2_format
+        except Exception:
+            pass
+    bpy.types.WindowManager.uma_tools_export_uma2_format = bpy.props.BoolProperty(
+        name="UMA 2 Format",
+        description="Use UMA 2 FBX export axes for both export buttons",
+        default=False,
+    )
+
     if hasattr(bpy.types.WindowManager, "uma_tools_rename_prepend"):
         try:
             del bpy.types.WindowManager.uma_tools_rename_prepend
@@ -2395,6 +2382,12 @@ def unregister():
     if hasattr(bpy.types.WindowManager, "uma_tools_weight_mapping"):
         try:
             del bpy.types.WindowManager.uma_tools_weight_mapping
+        except Exception:
+            pass
+
+    if hasattr(bpy.types.WindowManager, "uma_tools_export_uma2_format"):
+        try:
+            del bpy.types.WindowManager.uma_tools_export_uma2_format
         except Exception:
             pass
 
