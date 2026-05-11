@@ -1679,6 +1679,567 @@ class UMA_OT_tools_select_all(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class UMA_OT_tools_parent_set_object(bpy.types.Operator):
+    bl_idname = "uma_tools.parent_set_object"
+    bl_label = "Set Parent (Object)"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    keep_transform: bpy.props.BoolProperty(
+        name="Keep Transform",
+        description="Keep transform when parenting",
+        default=True,
+    )
+
+    def execute(self, context):
+        bpy.ops.object.parent_set(type='OBJECT', keep_transform=self.keep_transform)
+        return {'FINISHED'}
+
+
+class UMA_OT_tools_parent_clear(bpy.types.Operator):
+    bl_idname = "uma_tools.parent_clear"
+    bl_label = "Clear Parent"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    clear_type: bpy.props.EnumProperty(
+        name="Clear Type",
+        items=[
+            ('CLEAR', "Clear Parent", "Clear parent and keep transformation"),
+            ('CLEAR_KEEP_TRANSFORM', "Clear and Keep Transform", "Clear parent and keep transform"),
+            ('CLEAR_INVERSE', "Clear Parent Inverse", "Clear inverse parent matrix"),
+        ],
+        default='CLEAR_KEEP_TRANSFORM',
+    )
+
+    def execute(self, context):
+        bpy.ops.object.parent_clear(type=self.clear_type)
+        return {'FINISHED'}
+
+
+class UMA_OT_tools_apply_all_transforms(bpy.types.Operator):
+    bl_idname = "uma_tools.apply_all_transforms"
+    bl_label = "Apply All Transforms"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        selected_objects = list(context.selected_objects)
+        if not selected_objects:
+            self.report({'WARNING'}, "No objects selected")
+            return {'CANCELLED'}
+
+        prev_active = context.view_layer.objects.active
+        prev_sel = _get_selected_objects(context)
+        applied = 0
+
+        try:
+            for obj in selected_objects:
+                if obj is None:
+                    continue
+
+                _ensure_object_mode(context, obj)
+                _deselect_all_objects(context)
+                obj.select_set(True)
+                context.view_layer.objects.active = obj
+
+                try:
+                    bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
+                    applied += 1
+                except RuntimeError as e:
+                    self.report({'WARNING'}, f"Could not apply transforms to {obj.name}: {str(e)}")
+        finally:
+            _deselect_all_objects(context)
+            for obj in prev_sel:
+                if obj and obj.name in context.scene.objects:
+                    obj.select_set(True)
+            context.view_layer.objects.active = prev_active
+
+        self.report({'INFO'}, f"Applied transforms to {applied} object(s)")
+        return {'FINISHED'}
+
+
+class UMA_OT_tools_generate_apply_data_transfer(bpy.types.Operator):
+    bl_idname = "uma_tools.generate_apply_data_transfer"
+    bl_label = "Generate Layers and Apply Data Transfer"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        selected_objects = list(context.selected_objects)
+        if not selected_objects:
+            self.report({'WARNING'}, "No objects selected")
+            return {'CANCELLED'}
+
+        prev_active = context.view_layer.objects.active
+        prev_sel = _get_selected_objects(context)
+        objects_processed = 0
+        modifiers_applied = 0
+
+        try:
+            for obj in selected_objects:
+                if obj is None or obj.type != 'MESH':
+                    continue
+
+                _ensure_object_mode(context, obj)
+                modifier_names = [mod.name for mod in obj.modifiers if mod.type == 'DATA_TRANSFER']
+                if not modifier_names:
+                    continue
+
+                objects_processed += 1
+
+                for modifier_name in modifier_names:
+                    _deselect_all_objects(context)
+                    obj.select_set(True)
+                    context.view_layer.objects.active = obj
+
+                    try:
+                        bpy.ops.object.datalayout_transfer(modifier=modifier_name)
+                        bpy.ops.object.modifier_apply(modifier=modifier_name)
+                        modifiers_applied += 1
+                    except RuntimeError as e:
+                        self.report({'WARNING'}, f"Could not process Data Transfer modifier '{modifier_name}' on {obj.name}: {str(e)}")
+                    except Exception as e:
+                        self.report({'WARNING'}, f"Error processing {obj.name}: {str(e)}")
+        finally:
+            _deselect_all_objects(context)
+            for obj in prev_sel:
+                if obj and obj.name in context.scene.objects:
+                    obj.select_set(True)
+            context.view_layer.objects.active = prev_active
+
+        if modifiers_applied > 0:
+            self.report({'INFO'}, f"Processed {objects_processed} object(s), applied {modifiers_applied} Data Transfer modifier(s)")
+            return {'FINISHED'}
+
+        self.report({'WARNING'}, "No Data Transfer modifiers found on selected objects")
+        return {'CANCELLED'}
+
+
+class UMA_OT_tools_duplicate_object(bpy.types.Operator):
+    bl_idname = "uma_tools.duplicate_object"
+    bl_label = "Duplicate Objects"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def _get_target_object(self, context):
+        target = getattr(context, "id", None)
+        if isinstance(target, bpy.types.Object):
+            return target
+
+        target = getattr(context, "object", None)
+        if isinstance(target, bpy.types.Object):
+            return target
+
+        target = getattr(context, "active_object", None)
+        if isinstance(target, bpy.types.Object):
+            return target
+
+        return None
+
+    def execute(self, context):
+        target = self._get_target_object(context)
+        if target is None:
+            self.report({'WARNING'}, "No object available to duplicate")
+            return {'CANCELLED'}
+
+        prev_active = context.view_layer.objects.active
+        prev_sel = _get_selected_objects(context)
+        before_ptrs = set()
+        for obj in context.scene.objects:
+            try:
+                before_ptrs.add(obj.as_pointer())
+            except Exception:
+                pass
+
+        try:
+            _ensure_object_mode(context, target)
+            _deselect_all_objects(context)
+            target.select_set(True)
+            context.view_layer.objects.active = target
+            bpy.ops.object.duplicate()
+        except RuntimeError as e:
+            self.report({'WARNING'}, f"Could not duplicate {target.name}: {str(e)}")
+            return {'CANCELLED'}
+
+        duplicate = None
+        for obj in context.selected_objects:
+            try:
+                if obj.as_pointer() not in before_ptrs:
+                    duplicate = obj
+                    break
+            except Exception:
+                pass
+
+        _deselect_all_objects(context)
+        for obj in prev_sel:
+            if obj and obj.name in context.scene.objects:
+                obj.select_set(True)
+        if duplicate is not None:
+            duplicate.select_set(True)
+            context.view_layer.objects.active = duplicate
+            self.report({'INFO'}, f"Duplicated {target.name}")
+        else:
+            context.view_layer.objects.active = prev_active
+            self.report({'INFO'}, f"Duplicated {target.name}")
+
+        return {'FINISHED'}
+
+
+class UMA_OT_tools_toggle_on(bpy.types.Operator):
+    bl_idname = "uma_tools.toggle_on"
+    bl_label = "Toggle On"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def _get_target_object(self, context):
+        target = getattr(context, "id", None)
+        if isinstance(target, bpy.types.Object):
+            return target
+
+        target = getattr(context, "object", None)
+        if isinstance(target, bpy.types.Object):
+            return target
+
+        target = getattr(context, "active_object", None)
+        if isinstance(target, bpy.types.Object):
+            return target
+
+        return None
+
+    def _get_target_collection(self, context, target):
+        if target is None:
+            return None
+
+        for attr_name in ("collection", "layer_collection"):
+            collection = getattr(context, attr_name, None)
+            if isinstance(collection, bpy.types.LayerCollection):
+                collection = getattr(collection, "collection", None)
+
+            if not isinstance(collection, bpy.types.Collection):
+                continue
+
+            try:
+                if collection.objects.get(target.name) is not None:
+                    return collection
+            except Exception:
+                pass
+
+        users_collection = getattr(target, "users_collection", ())
+        if users_collection:
+            return users_collection[0]
+
+        return None
+
+    def execute(self, context):
+        target = self._get_target_object(context)
+        if target is None:
+            self.report({'WARNING'}, "No object available to toggle on")
+            return {'CANCELLED'}
+
+        collection = self._get_target_collection(context, target)
+        if collection is None:
+            self.report({'WARNING'}, f"No collection found for {target.name}")
+            return {'CANCELLED'}
+
+        try:
+            target.hide_viewport = False
+        except Exception:
+            pass
+
+        try:
+            target.hide_set(False)
+        except Exception:
+            pass
+
+        hidden_count = 0
+        for obj in collection.objects:
+            if obj is None:
+                continue
+
+            if obj == target:
+                try:
+                    obj.hide_viewport = False
+                except Exception:
+                    pass
+                try:
+                    obj.hide_set(False)
+                except Exception:
+                    pass
+                continue
+
+            try:
+                was_hidden = obj.hide_get()
+            except Exception:
+                was_hidden = False
+
+            try:
+                obj.hide_set(True)
+                if not was_hidden:
+                    hidden_count += 1
+            except Exception:
+                continue
+
+        self.report({'INFO'}, f"Showing {target.name}; hid {hidden_count} other object(s) in {collection.name}")
+        return {'FINISHED'}
+
+
+class UMA_OT_tools_import_obj_uma(bpy.types.Operator):
+    bl_idname = "uma_tools.import_obj_uma"
+    bl_label = "Import Wavefront OBJ (UMA)"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    filepath: bpy.props.StringProperty(subtype="FILE_PATH", default="")
+    filter_glob: bpy.props.StringProperty(default="*.obj", options={'HIDDEN'})
+
+    def execute(self, context):
+        if not self.filepath:
+            self.report({'WARNING'}, "No OBJ file selected")
+            return {'CANCELLED'}
+
+        import_material = getattr(context.scene, "uma_tools_import_material", None)
+
+        before_ptrs = set()
+        for obj in context.scene.objects:
+            try:
+                before_ptrs.add(obj.as_pointer())
+            except Exception:
+                pass
+
+        try:
+            bpy.ops.wm.obj_import(filepath=self.filepath)
+        except Exception as e:
+            self.report({'ERROR'}, f"OBJ import failed: {str(e)}")
+            return {'CANCELLED'}
+
+        imported_objects = []
+        for obj in context.scene.objects:
+            try:
+                if obj.as_pointer() not in before_ptrs:
+                    imported_objects.append(obj)
+            except Exception:
+                pass
+
+        imported_meshes = [obj for obj in imported_objects if obj is not None and obj.type == 'MESH']
+        if not imported_meshes:
+            self.report({'WARNING'}, "Import finished, but no mesh objects were detected")
+            return {'CANCELLED'}
+
+        processed = 0
+        smooth_failures = 0
+
+        for obj in imported_meshes:
+            _ensure_object_mode(context, obj)
+            _deselect_all_objects(context)
+            obj.select_set(True)
+            context.view_layer.objects.active = obj
+
+            if import_material is not None and obj.data is not None:
+                mats = obj.data.materials
+                if len(mats) == 0:
+                    mats.append(import_material)
+                    target_slot = 0
+                else:
+                    target_slot = -1
+                    for idx, mat in enumerate(mats):
+                        if mat == import_material:
+                            target_slot = idx
+                            break
+                    if target_slot < 0:
+                        mats[0] = import_material
+                        target_slot = 0
+
+                if hasattr(obj.data, "polygons"):
+                    for poly in obj.data.polygons:
+                        poly.material_index = target_slot
+
+            import_scale = getattr(context.scene, "uma_tools_import_scale", (0.17, 0.17, 0.18))
+            import_rotation = getattr(context.scene, "uma_tools_import_rotation", (0.0, 0.0, 0.0))
+            import_location = getattr(context.scene, "uma_tools_import_location", (0.0, 0.089, 0.113))
+            
+            obj.scale = import_scale
+            obj.rotation_euler = import_rotation
+            bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
+            obj.location = import_location
+
+            try:
+                bpy.ops.object.mode_set(mode='EDIT')
+                bpy.ops.mesh.select_all(action='SELECT')
+                bpy.ops.mesh.faces_shade_smooth()
+            except RuntimeError:
+                smooth_failures += 1
+            finally:
+                if obj.mode != 'OBJECT':
+                    try:
+                        bpy.ops.object.mode_set(mode='OBJECT')
+                    except Exception:
+                        pass
+
+            processed += 1
+
+        _deselect_all_objects(context)
+        for obj in imported_meshes:
+            obj.select_set(True)
+        context.view_layer.objects.active = imported_meshes[0]
+
+        if smooth_failures:
+            self.report({'INFO'}, f"Imported {processed} mesh(es); smooth faces failed on {smooth_failures} mesh(es)")
+        else:
+            self.report({'INFO'}, f"Imported {processed} mesh(es) with UMA import settings")
+        return {'FINISHED'}
+
+    def invoke(self, context, event):
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+
+
+class UMA_OT_tools_import_copy_from_current(bpy.types.Operator):
+    bl_idname = "uma_tools.import_copy_from_current"
+    bl_label = "Copy Transform from Current"
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        obj = context.view_layer.objects.active
+        if obj is None:
+            self.report({'WARNING'}, "No active object selected")
+            return {'CANCELLED'}
+
+        scene = context.scene
+        scene.uma_tools_import_scale = obj.scale
+        scene.uma_tools_import_rotation = obj.rotation_euler
+        scene.uma_tools_import_location = obj.location
+
+        self.report({'INFO'}, f"Copied scale, rotation, and location from '{obj.name}'")
+        return {'FINISHED'}
+
+
+class UMA_OT_tools_import_paste_to_current(bpy.types.Operator):
+    bl_idname = "uma_tools.import_paste_to_current"
+    bl_label = "Paste Transform to Current"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        obj = context.view_layer.objects.active
+        if obj is None:
+            self.report({'WARNING'}, "No active object selected")
+            return {'CANCELLED'}
+
+        scene = context.scene
+        import_scale = getattr(scene, "uma_tools_import_scale", (0.17, 0.17, 0.18))
+        import_rotation = getattr(scene, "uma_tools_import_rotation", (0.0, 0.0, 0.0))
+        import_location = getattr(scene, "uma_tools_import_location", (0.0, 0.089, 0.113))
+
+        obj.scale = import_scale
+        obj.rotation_euler = import_rotation
+        obj.location = import_location
+
+        self.report({'INFO'}, f"Pasted scale, rotation, and location to '{obj.name}'")
+        return {'FINISHED'}
+
+
+class UMA_OT_tools_import_fbx_uma(bpy.types.Operator):
+    bl_idname = "uma_tools.import_fbx_uma"
+    bl_label = "Import FBX (UMA)"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    filepath: bpy.props.StringProperty(subtype="FILE_PATH", default="")
+    filter_glob: bpy.props.StringProperty(default="*.fbx", options={'HIDDEN'})
+
+    def execute(self, context):
+        if not self.filepath:
+            self.report({'WARNING'}, "No FBX file selected")
+            return {'CANCELLED'}
+
+        import_material = getattr(context.scene, "uma_tools_import_material", None)
+
+        before_ptrs = set()
+        for obj in context.scene.objects:
+            try:
+                before_ptrs.add(obj.as_pointer())
+            except Exception:
+                pass
+
+        try:
+            bpy.ops.import_scene.fbx(filepath=self.filepath)
+        except Exception as e:
+            self.report({'ERROR'}, f"FBX import failed: {str(e)}")
+            return {'CANCELLED'}
+
+        imported_objects = []
+        for obj in context.scene.objects:
+            try:
+                if obj.as_pointer() not in before_ptrs:
+                    imported_objects.append(obj)
+            except Exception:
+                pass
+
+        imported_meshes = [obj for obj in imported_objects if obj is not None and obj.type == 'MESH']
+        if not imported_meshes:
+            self.report({'WARNING'}, "Import finished, but no mesh objects were detected")
+            return {'CANCELLED'}
+
+        processed = 0
+        smooth_failures = 0
+
+        for obj in imported_meshes:
+            _ensure_object_mode(context, obj)
+            _deselect_all_objects(context)
+            obj.select_set(True)
+            context.view_layer.objects.active = obj
+
+            if import_material is not None and obj.data is not None:
+                mats = obj.data.materials
+                if len(mats) == 0:
+                    mats.append(import_material)
+                    target_slot = 0
+                else:
+                    target_slot = -1
+                    for idx, mat in enumerate(mats):
+                        if mat == import_material:
+                            target_slot = idx
+                            break
+                    if target_slot < 0:
+                        mats[0] = import_material
+                        target_slot = 0
+
+                if hasattr(obj.data, "polygons"):
+                    for poly in obj.data.polygons:
+                        poly.material_index = target_slot
+
+            import_scale = getattr(context.scene, "uma_tools_import_scale", (0.17, 0.17, 0.18))
+            import_rotation = getattr(context.scene, "uma_tools_import_rotation", (0.0, 0.0, 0.0))
+            import_location = getattr(context.scene, "uma_tools_import_location", (0.0, 0.089, 0.113))
+            
+            obj.scale = import_scale
+            obj.rotation_euler = import_rotation
+            bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
+            obj.location = import_location
+
+            try:
+                bpy.ops.object.mode_set(mode='EDIT')
+                bpy.ops.mesh.select_all(action='SELECT')
+                bpy.ops.mesh.faces_shade_smooth()
+            except RuntimeError:
+                smooth_failures += 1
+            finally:
+                if obj.mode != 'OBJECT':
+                    try:
+                        bpy.ops.object.mode_set(mode='OBJECT')
+                    except Exception:
+                        pass
+
+            processed += 1
+
+        _deselect_all_objects(context)
+        for obj in imported_meshes:
+            obj.select_set(True)
+        context.view_layer.objects.active = imported_meshes[0]
+
+        if smooth_failures:
+            self.report({'INFO'}, f"Imported {processed} mesh(es); smooth faces failed on {smooth_failures} mesh(es)")
+        else:
+            self.report({'INFO'}, f"Imported {processed} mesh(es) with UMA import settings")
+        return {'FINISHED'}
+
+    def invoke(self, context, event):
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+
+
 class UMA_OT_tools_fbx_export_all(bpy.types.Operator):
     bl_idname = "uma_tools.fbx_export_all"
     bl_label = "UMA FBX Export (All)"
@@ -2069,6 +2630,18 @@ class UMA_PT_tools_panel(bpy.types.Panel):
             col.prop(wm, "uma_tools_weight_mapping", text="Mapping")
             col.operator(UMA_OT_tools_copy_weights_to_selected.bl_idname, text="Copy weights to all selected")
 
+        # Parenting
+        box = layout.box()
+        _draw_fold_header(box, "uma_tools_section_parenting", "Parenting")
+        if wm.uma_tools_section_parenting:
+            parent_col = box.column(align=True)
+            parent_col.operator(UMA_OT_tools_parent_set_object.bl_idname, text="Set Parent (Object)")
+            parent_col.operator(UMA_OT_tools_parent_clear.bl_idname, text="Clear Parent (Keep Transform)").clear_type = 'CLEAR_KEEP_TRANSFORM'
+            parent_col.operator(UMA_OT_tools_parent_clear.bl_idname, text="Clear Parent Inverse").clear_type = 'CLEAR_INVERSE'
+            parent_col.separator()
+            parent_col.operator(UMA_OT_tools_apply_all_transforms.bl_idname, text="Apply All Transforms")
+            parent_col.operator(UMA_OT_tools_generate_apply_data_transfer.bl_idname, text="Generate Layers and Apply Data Transfer")
+
         # Utilities
         box = layout.box()
         _draw_fold_header(box, "uma_tools_section_utilities", "Utilities")
@@ -2124,6 +2697,27 @@ class UMA_PT_tools_panel(bpy.types.Panel):
             udim.operator(UMA_OT_tools_split_udims_to_textures.bl_idname, text="Split UDIMS into separate textures")
             udim.operator(UMA_OT_tools_reset_to_udim.bl_idname, text="Reset to UDIM")
 
+        # UMA Import
+        box = layout.box()
+        _draw_fold_header(box, "uma_tools_section_import", "UMA Import")
+        if wm.uma_tools_section_import:
+            imp = box.column(align=True)
+            imp.prop(scene, "uma_tools_import_material", text="Material")
+            imp.label(text="Scale (X, Y, Z):")
+            imp.prop(scene, "uma_tools_import_scale", text="")
+            imp.label(text="Rotation (X, Y, Z):")
+            imp.prop(scene, "uma_tools_import_rotation", text="")
+            imp.label(text="Location (X, Y, Z):")
+            imp.prop(scene, "uma_tools_import_location", text="")
+            row = imp.row(align=True)
+            row.operator(UMA_OT_tools_import_copy_from_current.bl_idname, text="Copy from current")
+            row.operator(UMA_OT_tools_import_paste_to_current.bl_idname, text="Paste to current")
+            imp.separator()
+            imp.operator_context = 'INVOKE_DEFAULT'
+            imp.operator(UMA_OT_tools_import_obj_uma.bl_idname, text="Import Wavefront OBJ")
+            imp.operator(UMA_OT_tools_import_fbx_uma.bl_idname, text="Import FBX")
+            imp.operator_context = 'EXEC_DEFAULT'
+
         # UMA Export
         box = layout.box()
         _draw_fold_header(box, "uma_tools_section_export", "UMA Export")
@@ -2167,6 +2761,31 @@ class UMA_UL_tools_vertex_group_quick_select(bpy.types.UIList):
             layout.label(text="")
 
 
+def draw_outliner_object_context(self, context):
+    layout = self.layout
+
+    layout.separator()
+    layout.label(text="UMA", icon='ARMATURE_DATA')
+    layout.operator(UMA_OT_tools_duplicate_object.bl_idname, text="Duplicate Objects")
+    layout.operator(UMA_OT_tools_toggle_on.bl_idname, text="Toggle On", icon='HIDE_OFF')
+    layout.operator(UMA_OT_tools_apply_all_transforms.bl_idname, text="Apply All Transforms", icon='CHECKMARK')
+    layout.operator(UMA_OT_tools_generate_apply_data_transfer.bl_idname, text="Generate Layers and Apply Data Transfer", icon='MOD_DATA_TRANSFER')
+
+    layout.separator()
+    layout.label(text="Parent", icon='CONSTRAINT_BONE')
+
+    layout.operator(UMA_OT_tools_parent_set_object.bl_idname, text="Set Parent (Object)").keep_transform = True
+    layout.operator(UMA_OT_tools_parent_clear.bl_idname, text="Clear Parent (Keep Transform)").clear_type = 'CLEAR_KEEP_TRANSFORM'
+    layout.operator(UMA_OT_tools_parent_clear.bl_idname, text="Clear Parent Inverse").clear_type = 'CLEAR_INVERSE'
+
+    layout.separator()
+    layout.label(text="UMA Export", icon='EXPORT')
+    layout.operator_context = 'INVOKE_DEFAULT'
+    layout.operator(UMA_OT_tools_fbx_export_all.bl_idname, text="Export FBX (All)", icon='SCENE_DATA')
+    layout.operator(UMA_OT_tools_fbx_export_selected.bl_idname, text="Export FBX (Selected)", icon='RESTRICT_SELECT_OFF')
+    layout.operator_context = 'EXEC_DEFAULT'
+
+
 classes = (
     UMA_ToolsReportLine,
     UMA_ToolsVertexGroupQuickSelectItem,
@@ -2195,6 +2814,16 @@ classes = (
     UMA_OT_tools_cursor_move_to_origin,
     UMA_OT_tools_cursor_align_with_object,
     UMA_OT_tools_remove_vertex_group_quick_select,
+    UMA_OT_tools_parent_set_object,
+    UMA_OT_tools_parent_clear,
+    UMA_OT_tools_apply_all_transforms,
+    UMA_OT_tools_generate_apply_data_transfer,
+    UMA_OT_tools_duplicate_object,
+    UMA_OT_tools_toggle_on,
+    UMA_OT_tools_import_obj_uma,
+    UMA_OT_tools_import_copy_from_current,
+    UMA_OT_tools_import_paste_to_current,
+    UMA_OT_tools_import_fbx_uma,
     UMA_OT_tools_fbx_export_all,
     UMA_OT_tools_fbx_export_selected,
     UMA_OT_tools_split_udims_to_textures,
@@ -2205,12 +2834,19 @@ classes = (
 
 def register():
     # Allow re-running from the Text Editor without duplicate registrations.
+    try:
+        bpy.types.OUTLINER_MT_object.remove(draw_outliner_object_context)
+    except Exception:
+        pass
+
     for cls in classes:
         try:
             bpy.utils.unregister_class(cls)
         except Exception:
             pass
         bpy.utils.register_class(cls)
+
+    bpy.types.OUTLINER_MT_object.append(draw_outliner_object_context)
 
     # Avoid bpy.data.* access in register (may be restricted during install).
     if hasattr(bpy.types.WindowManager, "uma_tools_report_lines"):
@@ -2244,6 +2880,62 @@ def register():
     bpy.types.Scene.uma_tools_group_quick_select_index = bpy.props.IntProperty(
         default=0,
         update=_on_quick_select_index_update,
+    )
+
+    if hasattr(bpy.types.Scene, "uma_tools_import_material"):
+        try:
+            del bpy.types.Scene.uma_tools_import_material
+        except Exception:
+            pass
+    bpy.types.Scene.uma_tools_import_material = bpy.props.PointerProperty(
+        name="Import Material",
+        description="Material assigned to meshes imported from UMA Import",
+        type=bpy.types.Material,
+    )
+
+    if hasattr(bpy.types.Scene, "uma_tools_import_scale"):
+        try:
+            del bpy.types.Scene.uma_tools_import_scale
+        except Exception:
+            pass
+    bpy.types.Scene.uma_tools_import_scale = bpy.props.FloatVectorProperty(
+        name="Import Scale",
+        description="Scale (X, Y, Z) applied to imported meshes",
+        size=3,
+        default=(0.17, 0.17, 0.18),
+        min=0.001,
+        max=100.0,
+        step=0.01,
+    )
+
+    if hasattr(bpy.types.Scene, "uma_tools_import_location"):
+        try:
+            del bpy.types.Scene.uma_tools_import_location
+        except Exception:
+            pass
+    bpy.types.Scene.uma_tools_import_location = bpy.props.FloatVectorProperty(
+        name="Import Location",
+        description="Location (X, Y, Z) applied to imported meshes",
+        size=3,
+        default=(0.0, 0.089, 0.113),
+        min=-1000.0,
+        max=1000.0,
+        step=0.001,
+    )
+
+    if hasattr(bpy.types.Scene, "uma_tools_import_rotation"):
+        try:
+            del bpy.types.Scene.uma_tools_import_rotation
+        except Exception:
+            pass
+    bpy.types.Scene.uma_tools_import_rotation = bpy.props.FloatVectorProperty(
+        name="Import Rotation",
+        description="Rotation (X, Y, Z) in radians applied to imported meshes",
+        size=3,
+        default=(0.0, 0.0, 0.0),
+        min=-6.283,
+        max=6.283,
+        step=0.01,
     )
 
     if hasattr(bpy.types.WindowManager, "uma_tools_weights_source"):
@@ -2325,11 +3017,13 @@ def register():
     for prop_name, default in (
         ("uma_tools_section_error_checking", True),
         ("uma_tools_section_copy_weights", False),
+        ("uma_tools_section_parenting", True),
         ("uma_tools_section_utilities", True),
         ("uma_tools_section_editing_tools", False),
         ("uma_tools_section_vertex_group_quick_select", False),
         ("uma_tools_section_3d_cursor", False),
         ("uma_tools_section_udim_tools", False),
+        ("uma_tools_section_import", True),
         ("uma_tools_section_export", True),
     ):
         if hasattr(bpy.types.WindowManager, prop_name):
@@ -2345,6 +3039,11 @@ def register():
 
 
 def unregister():
+    try:
+        bpy.types.OUTLINER_MT_object.remove(draw_outliner_object_context)
+    except Exception:
+        pass
+
     if hasattr(bpy.types.WindowManager, "uma_tools_report_lines"):
         try:
             del bpy.types.WindowManager.uma_tools_report_lines
@@ -2364,6 +3063,30 @@ def unregister():
     if hasattr(bpy.types.Scene, "uma_tools_group_quick_select_index"):
         try:
             del bpy.types.Scene.uma_tools_group_quick_select_index
+        except Exception:
+            pass
+
+    if hasattr(bpy.types.Scene, "uma_tools_import_material"):
+        try:
+            del bpy.types.Scene.uma_tools_import_material
+        except Exception:
+            pass
+
+    if hasattr(bpy.types.Scene, "uma_tools_import_scale"):
+        try:
+            del bpy.types.Scene.uma_tools_import_scale
+        except Exception:
+            pass
+
+    if hasattr(bpy.types.Scene, "uma_tools_import_location"):
+        try:
+            del bpy.types.Scene.uma_tools_import_location
+        except Exception:
+            pass
+
+    if hasattr(bpy.types.Scene, "uma_tools_import_rotation"):
+        try:
+            del bpy.types.Scene.uma_tools_import_rotation
         except Exception:
             pass
 
@@ -2405,11 +3128,13 @@ def unregister():
     for prop_name in (
         "uma_tools_section_error_checking",
         "uma_tools_section_copy_weights",
+        "uma_tools_section_parenting",
         "uma_tools_section_utilities",
         "uma_tools_section_editing_tools",
         "uma_tools_section_vertex_group_quick_select",
         "uma_tools_section_3d_cursor",
         "uma_tools_section_udim_tools",
+        "uma_tools_section_import",
         "uma_tools_section_export",
     ):
         if hasattr(bpy.types.WindowManager, prop_name):
