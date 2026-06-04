@@ -428,14 +428,27 @@ def _uma_fbx_export_kwargs(context, use_selection: bool):
     }
 
 
-def _iter_target_objects(context, selected_only: bool):
+def _iter_target_objects(context, selected_only: bool, visible_only: bool = False):
     if selected_only:
         objs = list(context.selected_objects)
     else:
         objs = list(context.scene.objects)
 
     # Only process meshes and armatures (bones) for UMA workflows.
-    return [o for o in objs if o is not None and o.type in {'MESH', 'ARMATURE'}]
+    targets = [o for o in objs if o is not None and o.type in {'MESH', 'ARMATURE'}]
+    if not visible_only:
+        return targets
+
+    visible_targets = []
+    for obj in targets:
+        try:
+            if not obj.visible_get():
+                continue
+        except Exception:
+            if getattr(obj, "hide_viewport", False):
+                continue
+        visible_targets.append(obj)
+    return visible_targets
 
 
 def _deselect_all_objects(context):
@@ -745,9 +758,10 @@ class UMA_OT_tools_check_errors(bpy.types.Operator):
     bl_options = {'REGISTER'}
 
     selected_only: bpy.props.BoolProperty(default=False)
+    visible_only: bpy.props.BoolProperty(default=True)
 
     def execute(self, context):
-        targets = _iter_target_objects(context, self.selected_only)
+        targets = _iter_target_objects(context, self.selected_only, self.visible_only)
 
         issues = []
 
@@ -2584,8 +2598,10 @@ class UMA_PT_tools_panel(bpy.types.Panel):
         _draw_fold_header(box, "uma_tools_section_error_checking", "Error checking")
         if wm.uma_tools_section_error_checking:
             col = box.column(align=True)
+            col.prop(wm, "uma_tools_error_check_visible_only", text="Visible Only")
             op = col.operator(UMA_OT_tools_check_errors.bl_idname, text="Check for Errors")
             op.selected_only = False
+            op.visible_only = wm.uma_tools_error_check_visible_only
 
             row = col.row(align=True)
             row.operator(UMA_OT_tools_select_all.bl_idname, text="Select All")
@@ -2863,6 +2879,17 @@ def register():
     bpy.types.WindowManager.uma_tools_report_lines = bpy.props.CollectionProperty(type=UMA_ToolsReportLine)
     bpy.types.WindowManager.uma_tools_report_index = bpy.props.IntProperty(default=0)
 
+    if hasattr(bpy.types.WindowManager, "uma_tools_error_check_visible_only"):
+        try:
+            del bpy.types.WindowManager.uma_tools_error_check_visible_only
+        except Exception:
+            pass
+    bpy.types.WindowManager.uma_tools_error_check_visible_only = bpy.props.BoolProperty(
+        name="Visible Only",
+        description="Skip hidden objects when checking the scene for export issues",
+        default=True,
+    )
+
     if hasattr(bpy.types.Scene, "uma_tools_group_quick_select"):
         try:
             del bpy.types.Scene.uma_tools_group_quick_select
@@ -3052,6 +3079,11 @@ def unregister():
     if hasattr(bpy.types.WindowManager, "uma_tools_report_index"):
         try:
             del bpy.types.WindowManager.uma_tools_report_index
+        except Exception:
+            pass
+    if hasattr(bpy.types.WindowManager, "uma_tools_error_check_visible_only"):
+        try:
+            del bpy.types.WindowManager.uma_tools_error_check_visible_only
         except Exception:
             pass
 
