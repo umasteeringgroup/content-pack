@@ -15,6 +15,7 @@ import bpy
 import os
 import bmesh
 import math
+import time
 from mathutils import Matrix, kdtree
 
 
@@ -1151,39 +1152,26 @@ class UMA_OT_tools_reset_pose_transforms(bpy.types.Operator):
             self.report({'WARNING'}, "No armatures found in the scene")
             return {'CANCELLED'}
 
-        prev_active = context.view_layer.objects.active
-        prev_selected = _get_selected_objects(context)
-        prev_mode = prev_active.mode if prev_active else 'OBJECT'
-
+        reset_bones = 0
         try:
             for arm in armatures:
-                _deselect_all_objects(context)
-                arm.select_set(True)
-                context.view_layer.objects.active = arm
+                pose = getattr(arm, "pose", None)
+                if pose is None:
+                    continue
+                for pose_bone in pose.bones:
+                    # Reset the pose channels without relying on an active
+                    # object, selection state, or a View3D operator context.
+                    pose_bone.matrix_basis = Matrix.Identity(4)
+                    reset_bones += 1
 
-                if arm.mode != 'POSE':
-                    bpy.ops.object.mode_set(mode='POSE')
-
-                bpy.ops.pose.select_all(action='SELECT')
-                bpy.ops.pose.transforms_clear()
-
-        except RuntimeError as e:
+        except (AttributeError, RuntimeError, TypeError) as e:
             self.report({'ERROR'}, f"Reset pose transforms failed: {str(e)}")
             return {'CANCELLED'}
-        finally:
-            _deselect_all_objects(context)
-            for o in prev_selected:
-                if o and o.name in context.scene.objects:
-                    o.select_set(True)
-            context.view_layer.objects.active = prev_active
 
-            if prev_active is not None:
-                try:
-                    bpy.ops.object.mode_set(mode=prev_mode)
-                except Exception:
-                    bpy.ops.object.mode_set(mode='OBJECT')
-
-        self.report({'INFO'}, f"Reset pose transforms on {len(armatures)} armature(s)")
+        self.report(
+            {'INFO'},
+            f"Reset {reset_bones} pose bone(s) on {len(armatures)} armature(s)",
+        )
         return {'FINISHED'}
 
 
@@ -2646,6 +2634,12 @@ class UMA_PT_tools_panel(bpy.types.Panel):
             col.prop(wm, "uma_tools_weight_mapping", text="Mapping")
             col.operator(UMA_OT_tools_copy_weights_to_selected.bl_idname, text="Copy weights to all selected")
 
+        # Ponytail Weights
+        box = layout.box()
+        _draw_fold_header(box, "uma_tools_section_pony_weights", "Ponytail Weights")
+        if wm.uma_tools_section_pony_weights:
+            _draw_pony_tail_weights_ui(box.column(align=True), scene)
+
         # Parenting
         box = layout.box()
         _draw_fold_header(box, "uma_tools_section_parenting", "Parenting")
@@ -2802,6 +2796,379 @@ def draw_outliner_object_context(self, context):
     layout.operator_context = 'EXEC_DEFAULT'
 
 
+# ---------------------------------------------------------------------------
+# Ponytail / Hair Weighting - PropertyGroup, UIList, Operators, and Panel
+# ---------------------------------------------------------------------------
+# Usage:
+#   1. Select an armature (or a mesh with an Armature modifier) and enter
+#      Pose or Edit mode. Select the bones you want to use for weighting.
+#   2. In the UMA Tools sidebar "Ponytail Weights" section, press
+#      "Add Selected Bones" to build the bone list.
+#   3. Select a mesh and optionally select specific vertices (in Edit mode).
+#   4. Adjust "Smooth Factor" (0 = nearest bone only, 1 = broad blend).
+#   5. Press "Calculate weights for bones".
+#   The operator creates vertex groups named after each bone, removes the
+#   processed vertices from groups *not* in the list, and assigns normalized
+#   weights using a Gaussian radial-basis function.
+# ---------------------------------------------------------------------------
+
+
+class UMATools_PonyBoneItem(bpy.types.PropertyGroup):
+    """Stores a single bone name for the ponytail weighting list."""
+    bone_name: bpy.props.StringProperty(name="Bone", default="")
+
+
+class UMATools_UL_pony_bones(bpy.types.UIList):
+    """UIList that displays the ponytail bone name list."""
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
+        if self.layout_type in {'DEFAULT', 'COMPACT'}:
+            layout.label(text=getattr(item, "bone_name", ""), icon='BONE_DATA')
+        else:
+            layout.label(text="")
+
+
+def _draw_pony_tail_weights_ui(layout, scene):
+    """Draw the shared ponytail weighting controls."""
+    layout.template_list(
+        "UMATools_UL_pony_bones",
+        "",
+        scene,
+        "umatools_pony_bones",
+        scene,
+        "umatools_pony_bones_index",
+        rows=5,
+    )
+
+    row = layout.row(align=True)
+    row.operator(UMATools_OT_add_pony_bones.bl_idname, text="Add Selected Bones")
+
+    row = layout.row(align=True)
+    op = row.operator(UMATools_OT_remove_pony_bone.bl_idname, text="Remove Selected")
+    op.index = scene.umatools_pony_bones_index
+    row.operator(UMATools_OT_clear_pony_bones.bl_idname, text="Clear List")
+
+    layout.separator()
+    layout.prop(scene, "umatools_pony_smooth", text="Smooth Factor", slider=True)
+    layout.operator(
+        UMATools_OT_calculate_pony_weights.bl_idname,
+        text="Calculate weights for bones",
+        icon='MOD_VERTEX_WEIGHT',
+    )
+
+
+class UMATools_OT_add_pony_bones(bpy.types.Operator):
+    """Add selected bones from the active armature to the ponytail bone list.
+
+    Works in Pose, Edit, or Object mode. Duplicate names are skipped.
+    """
+    bl_idname = "umatools.add_pony_bones"
+    bl_label = "Add Selected Bones"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        scene = context.scene
+        try:
+            armature_obj = None
+            active_obj = context.view_layer.objects.active
+            if active_obj and active_obj.type == 'ARMATURE':
+                armature_obj = active_obj
+            else:
+                for obj in context.selected_objects:
+                    if obj.type == 'ARMATURE':
+                        armature_obj = obj
+                        break
+
+            if armature_obj is None:
+                self.report({'ERROR'}, "Select an armature and choose one or more bones")
+                return {'CANCELLED'}
+
+            selected_names = []
+            if armature_obj.mode == 'EDIT':
+                # In armature edit mode, selected edit bones are separate from
+                # armature.data.bones. Use the edit collection directly.
+                selected_names = [bone.name for bone in armature_obj.data.edit_bones if bone.select]
+            elif armature_obj.mode == 'POSE':
+                selected_pose_bones = getattr(context, "selected_pose_bones", None) or []
+                selected_names = [pb.name for pb in selected_pose_bones]
+            else:
+                selected_names = [bone.name for bone in armature_obj.data.bones if bone.select]
+
+            if not selected_names:
+                self.report({'ERROR'}, "No bones are selected on the active armature")
+                return {'CANCELLED'}
+
+            existing = {item.bone_name for item in scene.umatools_pony_bones}
+            added = 0
+            for name in selected_names:
+                if name in existing:
+                    continue
+                item = scene.umatools_pony_bones.add()
+                item.bone_name = name
+                existing.add(name)
+                added += 1
+
+            if added > 0:
+                self.report({'INFO'}, f"Added {added} bone(s) to ponytail list")
+            else:
+                self.report({'INFO'}, "Selected bones are already in the list")
+            return {'FINISHED'}
+        except Exception as ex:
+            self.report({'ERROR'}, f"Could not add selected bones: {ex}")
+            return {'CANCELLED'}
+
+
+class UMATools_OT_remove_pony_bone(bpy.types.Operator):
+    """Remove the selected entry from the ponytail bone list."""
+    bl_idname = "umatools.remove_pony_bone"
+    bl_label = "Remove Selected"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    index: bpy.props.IntProperty(default=-1)
+
+    def execute(self, context):
+        scene = context.scene
+        collection = scene.umatools_pony_bones
+        if self.index < 0 or self.index >= len(collection):
+            return {'CANCELLED'}
+        collection.remove(self.index)
+        scene.umatools_pony_bones_index = min(
+            scene.umatools_pony_bones_index,
+            max(0, len(collection) - 1),
+        )
+        return {'FINISHED'}
+
+
+class UMATools_OT_clear_pony_bones(bpy.types.Operator):
+    """Clear the entire ponytail bone list."""
+    bl_idname = "umatools.clear_pony_bones"
+    bl_label = "Clear List"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        context.scene.umatools_pony_bones.clear()
+        context.scene.umatools_pony_bones_index = 0
+        self.report({'INFO'}, "Ponytail bone list cleared")
+        return {'FINISHED'}
+
+
+class UMATools_OT_calculate_pony_weights(bpy.types.Operator):
+    """Calculate and assign vertex weights limited to the chosen ponytail bones.
+
+    Uses a parameterized Gaussian radial-basis function controlled by the
+    Smooth Factor slider.  The Gaussian is preferred over inverse-distance
+    weighting because it is numerically stable at all distances and provides
+    an intuitive mapping: factor=0 -> nearest-only (hard assignment),
+    factor=1 -> broad smooth blending.
+
+    If you wish to experiment with alternative smoothing functions, you can
+    replace the Gaussian block (marked below) with one of these:
+
+        # Softmax over negative distances:
+        #   raw = [math.exp(-d) for d in distances]
+        #   total = sum(raw) or 1.0
+        #   weights = [r / total for r in raw]
+
+        # Inverse-distance with exponent:
+        #   epsilon = 1e-6
+        #   raw = [1.0 / (d + epsilon) ** exponent for d in distances]
+
+    The Gaussian is the default because its sigma parameter cleanly maps
+    to the Smooth Factor without introducing a hard singularity at d=0.
+    """
+    bl_idname = "umatools.calculate_pony_weights"
+    bl_label = "Calculate Weights for Bones"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        t_start = time.perf_counter()
+        scene = context.scene
+        mesh_obj = context.view_layer.objects.active
+        prev_mode = None
+        progress_started = False
+
+        try:
+            if mesh_obj is None or mesh_obj.type != 'MESH':
+                self.report({'ERROR'}, "Active object must be a mesh")
+                return {'CANCELLED'}
+
+            mesh_data = mesh_obj.data
+            prev_mode = mesh_obj.mode
+
+            # Use selected edit-mode vertices when present. If none are
+            # selected, process the full mesh as requested.
+            selected_vert_indices = []
+            if prev_mode == 'EDIT':
+                bm = bmesh.from_edit_mesh(mesh_data)
+                bm.verts.ensure_lookup_table()
+                bm.verts.index_update()
+                selected_vert_indices = [vert.index for vert in bm.verts if vert.select]
+            if not selected_vert_indices:
+                selected_vert_indices = [vert.index for vert in mesh_data.vertices]
+
+            if not selected_vert_indices:
+                self.report({'ERROR'}, "Mesh has no vertices to process")
+                return {'CANCELLED'}
+
+            armature_obj = None
+            for mod in mesh_obj.modifiers:
+                if mod.type == 'ARMATURE' and getattr(mod, "object", None) is not None:
+                    armature_obj = mod.object
+                    break
+            if armature_obj is None:
+                for obj in context.selected_objects:
+                    if obj.type == 'ARMATURE':
+                        armature_obj = obj
+                        break
+            if armature_obj is None:
+                for obj in context.scene.objects:
+                    if obj.type == 'ARMATURE':
+                        armature_obj = obj
+                        break
+            if armature_obj is None:
+                self.report({'ERROR'}, "No armature found for the active mesh")
+                return {'CANCELLED'}
+
+            bone_names = []
+            seen_bones = set()
+            for item in scene.umatools_pony_bones:
+                name = (item.bone_name or "").strip()
+                if name and name not in seen_bones:
+                    bone_names.append(name)
+                    seen_bones.add(name)
+            if not bone_names:
+                self.report({'ERROR'}, "Bone list is empty. Add bones first.")
+                return {'CANCELLED'}
+
+            pose_bones = getattr(armature_obj.pose, "bones", None)
+            if pose_bones is None:
+                self.report({'ERROR'}, f"{armature_obj.name} has no pose bones")
+                return {'CANCELLED'}
+
+            valid_bones = []
+            skipped_bones = []
+            for name in bone_names:
+                pose_bone = pose_bones.get(name)
+                if pose_bone is None:
+                    skipped_bones.append(name)
+                else:
+                    valid_bones.append((name, pose_bone))
+
+            if skipped_bones:
+                skipped_preview = ", ".join(skipped_bones[:5])
+                suffix = "..." if len(skipped_bones) > 5 else ""
+                self.report({'WARNING'}, f"Skipped missing bones: {skipped_preview}{suffix}")
+            if not valid_bones:
+                self.report({'ERROR'}, "None of the listed bones exist in the armature")
+                return {'CANCELLED'}
+
+            if prev_mode != 'OBJECT':
+                context.view_layer.objects.active = mesh_obj
+                bpy.ops.object.mode_set(mode='OBJECT')
+                mesh_data = mesh_obj.data
+
+            vertex_groups = mesh_obj.vertex_groups
+            target_groups = {}
+            for name, _pose_bone in valid_bones:
+                group = vertex_groups.get(name)
+                if group is None:
+                    group = vertex_groups.new(name=name)
+                target_groups[name] = group
+
+            target_group_indices = {group.index for group in target_groups.values()}
+            remove_failures = 0
+            for group in list(vertex_groups):
+                if group.index in target_group_indices:
+                    continue
+                try:
+                    group.remove(selected_vert_indices)
+                except Exception:
+                    remove_failures += 1
+
+            arm_world = armature_obj.matrix_world
+            bone_positions = [(name, arm_world @ pose_bone.head) for name, pose_bone in valid_bones]
+            mat_world = mesh_obj.matrix_world
+            smooth_factor = max(0.0, min(1.0, scene.umatools_pony_smooth))
+            num_verts = len(selected_vert_indices)
+            num_bones = len(bone_positions)
+            min_sigma = 1e-4
+
+            wm = context.window_manager
+            wm.progress_begin(0, num_verts)
+            progress_started = True
+
+            for idx, vert_index in enumerate(selected_vert_indices):
+                if idx % 100 == 0:
+                    wm.progress_update(idx)
+
+                vertex = mesh_data.vertices[vert_index]
+                v_world = mat_world @ vertex.co
+                dist_sq = [(v_world - bone_pos).length_squared for _name, bone_pos in bone_positions]
+                max_dist = math.sqrt(max(dist_sq))
+
+                # Gaussian radial basis is stable at zero distance and gives a
+                # useful sigma control. It avoids the singularities common in
+                # naive inverse-distance weighting.
+                max_sigma = max_dist * 0.75 if max_dist > 0.0 else 1.0
+                sigma = min_sigma + (max_sigma - min_sigma) * smooth_factor
+
+                if smooth_factor <= 0.0 or sigma <= min_sigma:
+                    nearest_idx = min(range(num_bones), key=lambda bone_index: dist_sq[bone_index])
+                    raw_weights = [1.0 if bone_index == nearest_idx else 0.0 for bone_index in range(num_bones)]
+                else:
+                    inv_two_sigma_sq = 1.0 / (2.0 * sigma * sigma)
+                    raw_weights = [math.exp(-d2 * inv_two_sigma_sq) for d2 in dist_sq]
+
+                total = sum(raw_weights)
+                if total > 0.0:
+                    weights = [weight / total for weight in raw_weights]
+                else:
+                    weights = [1.0 / num_bones for _ in range(num_bones)]
+
+                for bone_index, (name, _bone_pos) in enumerate(bone_positions):
+                    target_groups[name].add([vert_index], weights[bone_index], 'REPLACE')
+
+            elapsed = time.perf_counter() - t_start
+            summary = (
+                f"Ponytail weights: {num_verts} vertices, {num_bones} bones, "
+                f"completed in {elapsed:.3f}s"
+            )
+            print(summary)
+            if remove_failures:
+                self.report({'WARNING'}, f"{summary}; {remove_failures} non-target group(s) could not be cleared")
+            else:
+                self.report({'INFO'}, summary)
+            return {'FINISHED'}
+
+        except Exception as ex:
+            self.report({'ERROR'}, f"Could not calculate ponytail weights: {ex}")
+            return {'CANCELLED'}
+        finally:
+            if progress_started:
+                try:
+                    context.window_manager.progress_end()
+                except Exception:
+                    pass
+            if mesh_obj is not None and prev_mode and prev_mode != 'OBJECT':
+                try:
+                    context.view_layer.objects.active = mesh_obj
+                    bpy.ops.object.mode_set(mode=prev_mode)
+                except Exception:
+                    pass
+
+
+class UMATools_PT_pony_tail_weights(bpy.types.Panel):
+    """Panel for hair/ponytail bone weighting in the UMA Tools sidebar."""
+    bl_label = "Ponytail Weights"
+    bl_idname = "UMATools_PT_pony_tail_weights"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = 'UMA Tools'
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        _draw_pony_tail_weights_ui(self.layout, context.scene)
+
+
 classes = (
     UMA_ToolsReportLine,
     UMA_ToolsVertexGroupQuickSelectItem,
@@ -2845,6 +3212,13 @@ classes = (
     UMA_OT_tools_split_udims_to_textures,
     UMA_OT_tools_reset_to_udim,
     UMA_PT_tools_panel,
+    # Ponytail / Hair Weighting
+    UMATools_PonyBoneItem,
+    UMATools_UL_pony_bones,
+    UMATools_OT_add_pony_bones,
+    UMATools_OT_remove_pony_bone,
+    UMATools_OT_clear_pony_bones,
+    UMATools_OT_calculate_pony_weights,
 )
 
 
@@ -3040,10 +3414,40 @@ def register():
         default="",
     )
 
+    # Ponytail / Hair Weighting - Scene properties
+    if hasattr(bpy.types.Scene, "umatools_pony_bones"):
+        try:
+            del bpy.types.Scene.umatools_pony_bones
+        except Exception:
+            pass
+    bpy.types.Scene.umatools_pony_bones = bpy.props.CollectionProperty(
+        type=UMATools_PonyBoneItem,
+    )
+    if hasattr(bpy.types.Scene, "umatools_pony_bones_index"):
+        try:
+            del bpy.types.Scene.umatools_pony_bones_index
+        except Exception:
+            pass
+    bpy.types.Scene.umatools_pony_bones_index = bpy.props.IntProperty(default=0)
+    if hasattr(bpy.types.Scene, "umatools_pony_smooth"):
+        try:
+            del bpy.types.Scene.umatools_pony_smooth
+        except Exception:
+            pass
+    bpy.types.Scene.umatools_pony_smooth = bpy.props.FloatProperty(
+        name="Smooth Factor",
+        description="0 = nearest bone only, 1 = broad smooth blend",
+        default=0.5,
+        min=0.0,
+        max=1.0,
+        subtype='FACTOR',
+    )
+
     # UI foldouts
     for prop_name, default in (
         ("uma_tools_section_error_checking", True),
         ("uma_tools_section_copy_weights", False),
+        ("uma_tools_section_pony_weights", False),
         ("uma_tools_section_parenting", True),
         ("uma_tools_section_utilities", True),
         ("uma_tools_section_editing_tools", False),
@@ -3122,6 +3526,23 @@ def unregister():
         except Exception:
             pass
 
+    # Ponytail / Hair Weighting - Scene properties
+    if hasattr(bpy.types.Scene, "umatools_pony_bones"):
+        try:
+            del bpy.types.Scene.umatools_pony_bones
+        except Exception:
+            pass
+    if hasattr(bpy.types.Scene, "umatools_pony_bones_index"):
+        try:
+            del bpy.types.Scene.umatools_pony_bones_index
+        except Exception:
+            pass
+    if hasattr(bpy.types.Scene, "umatools_pony_smooth"):
+        try:
+            del bpy.types.Scene.umatools_pony_smooth
+        except Exception:
+            pass
+
     if hasattr(bpy.types.WindowManager, "uma_tools_weights_source"):
         try:
             del bpy.types.WindowManager.uma_tools_weights_source
@@ -3160,6 +3581,7 @@ def unregister():
     for prop_name in (
         "uma_tools_section_error_checking",
         "uma_tools_section_copy_weights",
+        "uma_tools_section_pony_weights",
         "uma_tools_section_parenting",
         "uma_tools_section_utilities",
         "uma_tools_section_editing_tools",
