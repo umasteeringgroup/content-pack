@@ -1031,6 +1031,62 @@ class UMA_OT_tools_remove_negligible_weights(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class UMA_OT_tools_strip_weights_and_rig_to_selected(bpy.types.Operator):
+    bl_idname = "uma_tools.strip_weights_and_rig_to_selected"
+    bl_label = "Strip weights and rig to selected"
+    bl_description = "Remove all weights from the selected vertices and assign them fully to the active vertex group"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        obj = context.view_layer.objects.active
+        if obj is None or obj.type != 'MESH':
+            self.report({'ERROR'}, "Select a mesh object")
+            return {'CANCELLED'}
+
+        active_group = obj.vertex_groups.active
+        if active_group is None:
+            self.report({'ERROR'}, "No vertex group selected")
+            return {'CANCELLED'}
+
+        initial_mode = obj.mode
+        if initial_mode == 'EDIT':
+            bm = bmesh.from_edit_mesh(obj.data)
+            selected_indices = [vert.index for vert in bm.verts if vert.select]
+        else:
+            selected_indices = [vert.index for vert in obj.data.vertices if vert.select]
+
+        if not selected_indices:
+            self.report({'ERROR'}, "No vertices selected")
+            return {'CANCELLED'}
+
+        group_name = active_group.name
+
+        try:
+            if obj.mode != 'OBJECT':
+                bpy.ops.object.mode_set(mode='OBJECT')
+
+            # Vertex-group membership can only be changed in Object Mode.
+            for vertex_group in obj.vertex_groups:
+                vertex_group.remove(selected_indices)
+            active_group.add(selected_indices, 1.0, 'REPLACE')
+
+        except (RuntimeError, TypeError) as e:
+            self.report({'ERROR'}, f"Could not rig selected vertices: {str(e)}")
+            return {'CANCELLED'}
+        finally:
+            if obj.mode != initial_mode:
+                try:
+                    bpy.ops.object.mode_set(mode=initial_mode)
+                except Exception:
+                    pass
+
+        self.report(
+            {'INFO'},
+            f"Rigged {len(selected_indices)} vertex(es) 100% to bone '{group_name}'",
+        )
+        return {'FINISHED'}
+
+
 def _normalize_vertex_weights_for_indices(obj: bpy.types.Object, vertex_indices):
     normalized = 0
     skipped = 0
@@ -2633,6 +2689,11 @@ class UMA_PT_tools_panel(bpy.types.Panel):
             col.prop(wm, "uma_tools_smooth_weights", text="Smooth weights")
             col.prop(wm, "uma_tools_weight_mapping", text="Mapping")
             col.operator(UMA_OT_tools_copy_weights_to_selected.bl_idname, text="Copy weights to all selected")
+            col.separator()
+            col.operator(
+                UMA_OT_tools_strip_weights_and_rig_to_selected.bl_idname,
+                text="Strip weights and rig to selected",
+            )
 
         # Ponytail Weights
         box = layout.box()
@@ -3184,6 +3245,7 @@ classes = (
     UMA_OT_tools_process_rename_selected,
     UMA_OT_tools_remove_empty_vertex_groups,
     UMA_OT_tools_remove_negligible_weights,
+    UMA_OT_tools_strip_weights_and_rig_to_selected,
     UMA_OT_tools_normalize_selected_weights,
     UMA_OT_tools_normalize_all_weights,
     UMA_OT_tools_reset_pose_transforms,
