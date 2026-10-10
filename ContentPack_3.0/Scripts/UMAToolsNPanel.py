@@ -957,6 +957,218 @@ class UMA_OT_tools_copy_weights_to_selected(bpy.types.Operator):
         return {'FINISHED'}
 
 
+def _uma_tools_mesh_object_poll(self, obj):
+    return obj is not None and getattr(obj, "type", None) == 'MESH'
+
+
+def _uma_tools_create_fit_cage(context, obj, points, name):
+    # Use raw coordinates so pins, drivers, key mixes and modifiers cannot
+    # override the shapes picked in the fitting panel.
+    mesh = bpy.data.meshes.new(name)
+    cage = None
+    try:
+        mesh.from_pydata(
+            [point.co[:] for point in points],
+            [edge.vertices[:] for edge in obj.data.edges],
+            [polygon.vertices[:] for polygon in obj.data.polygons],
+        )
+        mesh.update()
+        cage = bpy.data.objects.new(name, mesh)
+        context.scene.collection.objects.link(cage)
+        cage.matrix_world = obj.matrix_world.copy()
+        cage.hide_render = True
+        return cage
+    except Exception:
+        if cage is not None:
+            bpy.data.objects.remove(cage, do_unlink=True)
+        bpy.data.meshes.remove(mesh)
+        raise
+
+
+def _uma_tools_remove_fit_cage(cage):
+    if cage is not None:
+        mesh = cage.data
+        bpy.data.objects.remove(cage, do_unlink=True)
+        if mesh.users == 0:
+            bpy.data.meshes.remove(mesh)
+
+
+class UMA_OT_tools_deform_selected_to_shape_key(bpy.types.Operator):
+    bl_idname = "uma_tools.deform_selected_to_shape_key"
+    bl_label = "Deform selected to shape key"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        wm = context.window_manager
+        source = getattr(wm, "uma_tools_blendshape_source", None)
+        from_name = getattr(wm, "uma_tools_blendshape_from", "") or ""
+        to_name = getattr(wm, "uma_tools_blendshape_to", "") or ""
+
+        if source is None or source.type != 'MESH':
+            self.report({'WARNING'}, "Pick a mesh source object")
+            return {'CANCELLED'}
+        if not from_name or not to_name:
+            self.report({'WARNING'}, "Pick From and To blendshapes from the source object")
+            return {'CANCELLED'}
+        if from_name == to_name:
+            self.report({'WARNING'}, "From and To blendshapes must be different")
+            return {'CANCELLED'}
+
+        shape_keys = getattr(source.data, "shape_keys", None)
+        key_blocks = getattr(shape_keys, "key_blocks", None)
+        if not key_blocks:
+            self.report({'WARNING'}, f"Source object '{source.name}' has no blendshapes")
+            return {'CANCELLED'}
+        from_key = key_blocks.get(from_name)
+        to_key = key_blocks.get(to_name)
+        if from_key is None or to_key is None:
+            self.report({'WARNING'}, "From/To blendshape not found on the source object")
+            return {'CANCELLED'}
+
+        targets = [o for o in context.selected_objects if o is not None and o.type == 'MESH' and o != source]
+        if not targets:
+            self.report({'WARNING'}, "No target meshes selected")
+            return {'CANCELLED'}
+
+        prev_active = context.view_layer.objects.active
+        prev_sel = _get_selected_objects(context)
+        prev_mode = prev_active.mode if prev_active is not None else 'OBJECT'
+        source_cage = None
+        done = 0
+        failed = []
+
+        try:
+            if context.mode != 'OBJECT':
+                bpy.ops.object.mode_set(mode='OBJECT')
+            from_coordinates = [coordinate for point in from_key.data for coordinate in point.co]
+            to_coordinates = [coordinate for point in to_key.data for coordinate in point.co]
+            source_cage = _uma_tools_create_fit_cage(context, source, from_key.data, "UMA_FitSource")
+
+            for obj in targets:
+                target_cage = None
+                original_data = obj.data
+                copied_data = None
+                output_key = None
+                created_basis = None
+                created_output = False
+                old_output = None
+                target_keys = obj.data.shape_keys
+                original_values = {key.name: key.value for key in target_keys.key_blocks} if target_keys else {}
+                original_active_key = obj.active_shape_key_index
+                try:
+                    if obj.library is not None:
+                        raise RuntimeError("target object is linked and cannot be edited")
+                    if target_keys and not target_keys.use_relative:
+                        raise RuntimeError("target uses absolute shape keys; relative shape keys are required")
+                    # Preserve the target's reference shape when fitting to a
+                    # source key with the same name (usually To = Basis).
+                    reference_name = target_keys.reference_key.name if target_keys else "Basis"
+                    output_name = f"{to_name}_Fit" if to_name == reference_name else to_name
+
+                    # Prefer a matching From key; otherwise the mesh's Basis is
+                    # the garment already fitted to the selected source From.
+                    bind_key = (target_keys.key_blocks.get(from_name) or target_keys.reference_key) if target_keys else None
+                    bind_points = bind_key.data if bind_key is not None else obj.data.vertices
+                    target_cage = _uma_tools_create_fit_cage(context, obj, bind_points, "UMA_FitTarget")
+                    source_cage.data.vertices.foreach_set("co", from_coordinates)
+                    source_cage.data.update()
+                    mod = target_cage.modifiers.new(name="UMA_BlendshapeFit", type='SURFACE_DEFORM')
+                    mod.target = source_cage
+
+                    _deselect_all_objects(context)
+                    target_cage.select_set(True)
+                    context.view_layer.objects.active = target_cage
+                    context.view_layer.update()
+                    bind_result = bpy.ops.object.surfacedeform_bind(modifier=mod.name)
+                    if 'FINISHED' not in bind_result or not mod.is_bound:
+                        raise RuntimeError("Surface Deform bind failed")
+
+                    source_cage.data.vertices.foreach_set("co", to_coordinates)
+                    source_cage.data.update()
+                    context.view_layer.update()
+                    fitted = target_cage.evaluated_get(context.evaluated_depsgraph_get())
+                    if len(fitted.data.vertices) != len(obj.data.vertices):
+                        raise RuntimeError("Surface Deform changed the target vertex count")
+                    coordinates = [coordinate for vertex in fitted.data.vertices for coordinate in vertex.co]
+                    if not all(math.isfinite(coordinate) for coordinate in coordinates):
+                        raise RuntimeError("Surface Deform produced invalid coordinates")
+
+                    # Commit only after fitting succeeds. Shared meshes need
+                    # their own output because objects can have different transforms.
+                    if obj.data.users > 1 or obj.data.library is not None:
+                        copied_data = obj.data.copy()
+                        obj.data = copied_data
+                    if obj.data.shape_keys is None:
+                        created_basis = obj.shape_key_add(name="Basis", from_mix=False)
+                    target_keys = obj.data.shape_keys
+                    output_key = target_keys.key_blocks.get(output_name)
+                    if output_key is not None:
+                        old_output = (
+                            [coordinate for point in output_key.data for coordinate in point.co],
+                            output_key.relative_key, output_key.vertex_group, output_key.mute,
+                            output_key.slider_min, output_key.slider_max,
+                        )
+                    else:
+                        output_key = obj.shape_key_add(name=output_name, from_mix=False)
+                        created_output = True
+                    output_key.data.foreach_set("co", coordinates)
+                    output_key.relative_key = target_keys.reference_key
+                    output_key.vertex_group = ""
+                    output_key.mute = False
+                    output_key.slider_min = 0.0
+                    output_key.slider_max = 1.0
+                    for key in target_keys.key_blocks:
+                        key.value = 1.0 if key == output_key else 0.0
+                    obj.active_shape_key_index = target_keys.key_blocks.find(output_key.name)
+                    obj.data.update()
+                    done += 1
+                except Exception as ex:
+                    failed.append(f"{obj.name} ({ex})")
+                    if copied_data is not None:
+                        obj.data = original_data
+                        if copied_data.users == 0:
+                            bpy.data.meshes.remove(copied_data)
+                    else:
+                        if created_output:
+                            obj.shape_key_remove(output_key)
+                        elif old_output is not None:
+                            output_key.data.foreach_set("co", old_output[0])
+                            output_key.relative_key = old_output[1]
+                            output_key.vertex_group = old_output[2]
+                            output_key.mute = old_output[3]
+                            output_key.slider_min = old_output[4]
+                            output_key.slider_max = old_output[5]
+                        if created_basis is not None:
+                            obj.shape_key_remove(created_basis)
+                    if copied_data is not None or output_key is not None or created_basis is not None:
+                        if obj.data.shape_keys is not None:
+                            for key in obj.data.shape_keys.key_blocks:
+                                if key.name in original_values:
+                                    key.value = original_values[key.name]
+                        obj.active_shape_key_index = original_active_key
+                finally:
+                    _uma_tools_remove_fit_cage(target_cage)
+        except Exception as ex:
+            self.report({'ERROR'}, f"Blendshape fitting failed: {ex}")
+            return {'CANCELLED'}
+        finally:
+            _uma_tools_remove_fit_cage(source_cage)
+            _deselect_all_objects(context)
+            for o in prev_sel:
+                if o and o.name in context.scene.objects:
+                    o.select_set(True)
+            context.view_layer.objects.active = prev_active
+            if prev_active is not None and prev_mode != 'OBJECT':
+                bpy.ops.object.mode_set(mode=prev_mode)
+            context.view_layer.update()
+
+        if failed:
+            self.report({'WARNING'}, f"Deformed {done} mesh(es); {len(failed)} failed: {', '.join(failed)}")
+            return {'CANCELLED'} if done == 0 else {'FINISHED'}
+        self.report({'INFO'}, f"Deformed {done} mesh(es) to blendshape '{to_name}'")
+        return {'FINISHED'}
+
+
 class UMA_OT_tools_process_rename_selected(bpy.types.Operator):
     bl_idname = "uma_tools.process_rename_selected"
     bl_label = "Process rename on selected"
@@ -2695,6 +2907,27 @@ class UMA_PT_tools_panel(bpy.types.Panel):
                 text="Strip weights and rig to selected",
             )
 
+        # Blendshapes fitting
+        box = layout.box()
+        _draw_fold_header(box, "uma_tools_section_blendshape_fitting", "Blendshapes fitting")
+        if wm.uma_tools_section_blendshape_fitting:
+            fit = box.column(align=True)
+            fit.prop(wm, "uma_tools_blendshape_source", text="Source object")
+            source_obj = getattr(wm, "uma_tools_blendshape_source", None)
+            if (source_obj is not None and source_obj.type == 'MESH'
+                    and getattr(source_obj.data, "shape_keys", None) is not None):
+                fit.prop_search(wm, "uma_tools_blendshape_from", source_obj.data.shape_keys, "key_blocks", text="From Blendshape")
+                fit.prop_search(wm, "uma_tools_blendshape_to", source_obj.data.shape_keys, "key_blocks", text="To Blendshape")
+            else:
+                fit.prop(wm, "uma_tools_blendshape_from", text="From Blendshape")
+                fit.prop(wm, "uma_tools_blendshape_to", text="To Blendshape")
+                if source_obj is None:
+                    fit.label(text="Pick a source object first", icon='INFO')
+                else:
+                    fit.label(text="Source has no blendshapes", icon='INFO')
+            fit.separator()
+            fit.operator(UMA_OT_tools_deform_selected_to_shape_key.bl_idname, text="Deform selected to shape key")
+
         # Ponytail Weights
         box = layout.box()
         _draw_fold_header(box, "uma_tools_section_pony_weights", "Ponytail Weights")
@@ -3242,6 +3475,7 @@ classes = (
     UMA_OT_tools_fix_transform_from_report,
     UMA_OT_tools_fix_missing_armature_modifiers,
     UMA_OT_tools_copy_weights_to_selected,
+    UMA_OT_tools_deform_selected_to_shape_key,
     UMA_OT_tools_process_rename_selected,
     UMA_OT_tools_remove_empty_vertex_groups,
     UMA_OT_tools_remove_negligible_weights,
@@ -3443,6 +3677,40 @@ def register():
         default='POLYINTERP_NEAREST',
     )
 
+    if hasattr(bpy.types.WindowManager, "uma_tools_blendshape_source"):
+        try:
+            del bpy.types.WindowManager.uma_tools_blendshape_source
+        except Exception:
+            pass
+    bpy.types.WindowManager.uma_tools_blendshape_source = bpy.props.PointerProperty(
+        name="Source object",
+        description="Source mesh holding the blendshapes used for surface deform fitting",
+        type=bpy.types.Object,
+        poll=_uma_tools_mesh_object_poll,
+    )
+
+    if hasattr(bpy.types.WindowManager, "uma_tools_blendshape_from"):
+        try:
+            del bpy.types.WindowManager.uma_tools_blendshape_from
+        except Exception:
+            pass
+    bpy.types.WindowManager.uma_tools_blendshape_from = bpy.props.StringProperty(
+        name="From Blendshape",
+        description="Exact source shape used to bind Surface Deform, regardless of current sliders or pins",
+        default="",
+    )
+
+    if hasattr(bpy.types.WindowManager, "uma_tools_blendshape_to"):
+        try:
+            del bpy.types.WindowManager.uma_tools_blendshape_to
+        except Exception:
+            pass
+    bpy.types.WindowManager.uma_tools_blendshape_to = bpy.props.StringProperty(
+        name="To Blendshape",
+        description="Exact source shape to deform the selected meshes to, regardless of current sliders or pins",
+        default="",
+    )
+
     if hasattr(bpy.types.WindowManager, "uma_tools_export_uma2_format"):
         try:
             del bpy.types.WindowManager.uma_tools_export_uma2_format
@@ -3509,6 +3777,7 @@ def register():
     for prop_name, default in (
         ("uma_tools_section_error_checking", True),
         ("uma_tools_section_copy_weights", False),
+        ("uma_tools_section_blendshape_fitting", False),
         ("uma_tools_section_pony_weights", False),
         ("uma_tools_section_parenting", True),
         ("uma_tools_section_utilities", True),
@@ -3623,6 +3892,24 @@ def unregister():
         except Exception:
             pass
 
+    if hasattr(bpy.types.WindowManager, "uma_tools_blendshape_source"):
+        try:
+            del bpy.types.WindowManager.uma_tools_blendshape_source
+        except Exception:
+            pass
+
+    if hasattr(bpy.types.WindowManager, "uma_tools_blendshape_from"):
+        try:
+            del bpy.types.WindowManager.uma_tools_blendshape_from
+        except Exception:
+            pass
+
+    if hasattr(bpy.types.WindowManager, "uma_tools_blendshape_to"):
+        try:
+            del bpy.types.WindowManager.uma_tools_blendshape_to
+        except Exception:
+            pass
+
     if hasattr(bpy.types.WindowManager, "uma_tools_export_uma2_format"):
         try:
             del bpy.types.WindowManager.uma_tools_export_uma2_format
@@ -3643,6 +3930,7 @@ def unregister():
     for prop_name in (
         "uma_tools_section_error_checking",
         "uma_tools_section_copy_weights",
+        "uma_tools_section_blendshape_fitting",
         "uma_tools_section_pony_weights",
         "uma_tools_section_parenting",
         "uma_tools_section_utilities",
